@@ -38,7 +38,7 @@ async def telnyx_webhook(request: Request):
             payload = event.data["payload"]
         else:  # dev mode: skip signature verification
             payload = (await request.json())["data"]["payload"]
-    except Exception:
+    except Exception as e:
         raise HTTPException(400, "Bad signature")
 
     # TelnyxObject -> dict if needed
@@ -59,13 +59,14 @@ async def telnyx_webhook(request: Request):
     images = [{"external_url": m["url"]} for m in payload.get("media", [])]
 
     # 3. Build and store your envelope row (replace the pseudo insert with your actual DB operation)
+    UTC = datetime.timezone.utc
     envelope = {
         "envelope_id": str(uuid.uuid4()),
         "user_id": from_num,
         "channel": "sms",
         "instruction": text.strip(),
         "payload": {"images": images},
-        "created_at": datetime.datetime.utcnow().isoformat()
+        "created_at": datetime.datetime.now(tz=UTC)
     }
     # Store envelope in Postgres
     try:
