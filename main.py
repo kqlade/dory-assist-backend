@@ -41,8 +41,15 @@ async def telnyx_webhook(request: Request):
     except Exception:
         raise HTTPException(400, "Bad signature")
 
-    from_num = payload["from"]["phone_number"]
-    text     = payload["text"]
+    # TelnyxObject -> dict if needed
+    if hasattr(payload, "to_dict"):
+        payload = payload.to_dict()
+
+    from_num = payload.get("from", {}).get("phone_number")
+    text     = payload.get("text", "")
+
+    if not from_num:
+        raise HTTPException(400, "Unexpected payload structure (missing from.phone_number)")
 
     # 2.1 Capture Telnyx media URLs directly (no re-hosting)
     images = [{"external_url": m["url"]} for m in payload.get("media", [])]
