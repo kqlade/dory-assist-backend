@@ -1,7 +1,7 @@
 """
 LLM-powered Parser/Planner agent.
 
-Converts an SMS/MMS “Envelope” + optional OCR text into a ParserReply.
+Converts an SMS/MMS "Envelope" + optional OCR text into a ParserReply.
 
 Author: <you>
 """
@@ -31,6 +31,8 @@ from app.types.parser_contract import ParserReply
 # ──────────────────────────────────────────────────────────────────────────
 
 _OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# Use a model that officially supports function/tool calling. Allow override via env.
+# As of 2024, o4-mini supports tool/function calling (see OpenAI/third-party docs).
 _MODEL          = os.getenv("OPENAI_MODEL", "o4-mini")
 _TIMEOUT        = float(os.getenv("OPENAI_TIMEOUT", "30"))
 
@@ -172,18 +174,32 @@ async def _call_openai(messages: List[ChatCompletionMessageParam]) -> str:
         model=_MODEL,
         messages=messages,
         tools=[{"type": "function", "function": FUNCTION_DEF}],
-        tool_choice="auto",
+        # Force the assistant to call the parse_sms function; if it cannot, the
+        # OpenAI API will raise an error instead of silently returning text.
+        tool_choice={"type": "function", "function": {"name": "parse_sms"}},
         # temperature=0.2,
         timeout=_TIMEOUT,
     )
 
     tool_calls = response.choices[0].message.tool_calls
-    if not tool_calls:
-        raise ValueError("LLM did not invoke the parse_sms tool")
 
-    args = tool_calls[0].function.arguments
-    # openai-python returns str; but if it ever returns dict, handle gracefully
-    return args if isinstance(args, str) else json.dumps(args)
+    if tool_calls:
+        args = tool_calls[0].function.arguments
+        # openai-python returns str; but if it ever returns dict, handle gracefully
+        return args if isinstance(args, str) else json.dumps(args)
+
+    # ──────────────────────────────────────────────
+    # Fallback: assistant replied with raw JSON text
+    # (This should not happen with the enforced tool_choice, but we keep it as
+    # an additional guardrail for forward compatibility.)
+    # ──────────────────────────────────────────────
+    content = response.choices[0].message.content or ""
+    try:
+        # Validate by round-tripping through json
+        json.loads(content)
+        return content  # type: ignore[return-value]
+    except Exception:
+        raise ValueError("LLM did not invoke the parse_sms tool and fallback JSON parse failed")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -207,7 +223,7 @@ async def run(envelope: Dict[str, Any], ocr_text: str | None = None) -> ParserRe
     raw_json = ""
     try:
         raw_json = await _call_openai(messages)
-        return ParserReply.parse_raw(_normalize_llm_json(raw_json))
+        return ParserReply.model_validate_json(_normalize_llm_json(raw_json))
     except Exception as e:
         # Attach raw json for debugging, if any
         msg = f"Failed to get/parse LLM JSON: {e}"
