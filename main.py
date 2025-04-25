@@ -23,6 +23,8 @@ app = FastAPI()
 @app.on_event("startup")
 async def startup_event():
     await db.get_pool()
+    await db.create_message_envelopes_table()
+    await db.create_reminders_table()
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -47,19 +49,13 @@ async def process_envelope_background(envelope: dict):
         print("Need clarification:", reply.clarification_question)
         return
 
-    if reply.intent in ("save", "both"):
-        celery_app.send_task(
-            "app.workers.entity_resolver.handle_save",
-            args=[envelope, [e.dict() for e in reply.entities]],
-            queue="save",
-        )
+    # Reminder-only MVP: we expect a fully-populated reminder task
+    if not reply.reminder:
+        print("Parser returned no reminder and no clarification – skipping")
+        return
 
-    if reply.intent in ("reminder", "both"):
-        celery_app.send_task(
-            "app.workers.reminder.handle",
-            args=[envelope, reply.dict()],
-            queue="reminder",
-        )
+    await db.insert_reminder(reply.reminder)
+    print("Reminder stored", reply.reminder.reminder_time)
 
 @app.post("/v1/sms/telnyx", response_class=PlainTextResponse)
 async def telnyx_webhook(request: Request):

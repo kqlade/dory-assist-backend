@@ -13,6 +13,7 @@ import json
 import logging
 import os
 from typing import Any, Dict, List, TypedDict
+from datetime import datetime, timedelta, timezone
 
 import openai
 from openai import AsyncOpenAI
@@ -24,7 +25,7 @@ from tenacity import (
     retry_if_exception_type,
 )
 
-from app.types.parser_contract import ParserReply
+from app.types.parser_contract import ReminderReply, ReminderTask
 
 # ──────────────────────────────────────────────────────────────────────────
 # Config
@@ -45,11 +46,13 @@ _LOGGER = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "You are a planning assistant that converts user SMS/MMS into structured "
-    "JSON with fields: intent, confidence (0-1), need_clarification, "
-    "clarification_question, and entities (list of drafts). "
-    "Use the schema provided and THINK step-by-step before responding. "
-    "Return ONLY JSON."
+    "You are an intake assistant that extracts time-based reminders from user "
+    "SMS/MMS (text + images + links). Use ALL information in the envelope, "
+    "including image content, to infer the reminder details. "
+    "Return ONLY JSON that matches the provided schema. "
+    "If you can fully determine the reminder, set need_clarification=false and "
+    "fill the reminder object. Otherwise set need_clarification=true and provide "
+    "a single clarification_question asking for the missing info."
 )
 
 TEXT_TEMPLATE = (
@@ -59,46 +62,31 @@ TEXT_TEMPLATE = (
 )
 
 FUNCTION_DEF = {
-    "name": "parse_sms",
-    "description": "Extract structured intent and entities from an SMS/MMS envelope.",
+    "name": "parse_reminder",
+    "description": "Extract a ReminderTask or clarification from an SMS/MMS envelope.",
     "parameters": {
         "type": "object",
         "properties": {
-            "intent": {
-                "type": "string",
-                "description": "User intent label",
-                "enum": ["save", "reminder", "both", "unknown"],
-            },
-            "confidence": {"type": "number"},
             "need_clarification": {"type": "boolean"},
             "clarification_question": {"type": "string"},
-            "entities": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "type": {"type": "string"},
-                        "name": {"type": "string"},
-                        "city": {"type": "string"},
-                        "tags": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                        "needs_resolution": {"type": "boolean"},
-                    },
-                    "required": ["type", "name"],
+            "reminder": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string"},
+                    "reminder_text": {"type": "string"},
+                    "reminder_time": {"type": "string"},
+                    "timezone": {"type": "string"},
+                    "channel": {"type": "string", "enum": ["sms"]},
                 },
+                "required": ["user_id", "reminder_text", "reminder_time", "timezone"],
             },
         },
-        "required": ["intent", "confidence"],
+        "required": ["need_clarification"],
         "additionalProperties": False,
     },
 }
 
-INTENT_SYNONYMS = {
-    "set_reminder": "reminder",
-    "add_reminder": "reminder",
-}
+INTENT_SYNONYMS: dict[str, str] = {}
 
 
 def _normalize_llm_json(raw: str) -> str:
@@ -112,18 +100,7 @@ def _normalize_llm_json(raw: str) -> str:
         else:
             raise
 
-    # Map intent synonyms
-    intent = data.get("intent")
-    if intent in INTENT_SYNONYMS:
-        data["intent"] = INTENT_SYNONYMS[intent]
-
-    # Patch entity field names
-    if isinstance(data.get("entities"), list):
-        for ent in data["entities"]:
-            if "entity" in ent and "value" in ent:
-                ent["type"] = ent.pop("entity")
-                ent["name"] = ent.pop("value")
-
+    # No special normalization needed for reminders-only MVP
     return json.dumps(data)
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -206,7 +183,7 @@ async def _call_openai(messages: List[ChatCompletionMessageParam]) -> str:
 # Public entry-point
 # ──────────────────────────────────────────────────────────────────────────
 
-async def run(envelope: Dict[str, Any], ocr_text: str | None = None) -> ParserReply:
+async def run(envelope: Dict[str, Any], ocr_text: str | None = None) -> ReminderReply:
     """
     Parse an MMS/SMS envelope + optional OCR into a structured ParserReply.
 
@@ -215,15 +192,22 @@ async def run(envelope: Dict[str, Any], ocr_text: str | None = None) -> ParserRe
     """
 
     if not _OPENAI_API_KEY:
-        # Fallback stub for local dev without API key
-        return ParserReply(intent="save", confidence=0.9, entities=[])
+        # Fallback stub for local dev without API key: create a dummy reminder 1 hour ahead
+        ts = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        dummy = ReminderTask(
+            user_id=envelope.get("user_id", "unknown"),
+            reminder_text=envelope.get("instruction", "todo"),
+            reminder_time=ts,
+            timezone="UTC",
+        )
+        return ReminderReply(need_clarification=False, reminder=dummy)
 
     messages = _build_messages(envelope, ocr_text)
 
     raw_json = ""
     try:
         raw_json = await _call_openai(messages)
-        return ParserReply.model_validate_json(_normalize_llm_json(raw_json))
+        return ReminderReply.model_validate_json(_normalize_llm_json(raw_json))
     except Exception as e:
         # Attach raw json for debugging, if any
         msg = f"Failed to get/parse LLM JSON: {e}"
