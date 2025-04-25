@@ -125,7 +125,7 @@ async def _call_openai(messages: List[ChatCompletionMessageParam]) -> str:
         messages=messages,
         tools=[{"type": "function", "function": FUNCTION_DEF}],
         tool_choice="auto",
-        temperature=0.2,
+        # temperature=0.2,
         timeout=_TIMEOUT,
     )
 
