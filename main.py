@@ -45,11 +45,15 @@ async def telnyx_webhook(request: Request):
     if hasattr(payload, "to_dict"):
         payload = payload.to_dict()
 
-    from_num = payload.get("from", {}).get("phone_number")
+    sender = payload.get("from") or payload.get("from_", {})
+    if hasattr(sender, "to_dict"):
+        sender = sender.to_dict()
+    from_num = sender.get("phone_number")
     text     = payload.get("text", "")
 
     if not from_num:
-        raise HTTPException(400, "Unexpected payload structure (missing from.phone_number)")
+        # Not an inbound message we care about (e.g., DLR). Acknowledge and exit.
+        return "IGNORED", status.HTTP_200_OK
 
     # 2.1 Capture Telnyx media URLs directly (no re-hosting)
     images = [{"external_url": m["url"]} for m in payload.get("media", [])]
