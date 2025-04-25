@@ -29,9 +29,9 @@ class EntityDraft(BaseModel):
     needs_resolution: bool = True
 
     # Normalise tags to lowercase for consistency
-    @field_validator("tags", each_item=True)
-    def _lowercase(cls, v: str) -> str:  # noqa: N805
-        return v.lower()
+    @field_validator("tags")
+    def _lowercase(cls, v: list[str]):  # noqa: N805
+        return [t.lower() for t in v]
 
 
 # ──────────────────────────────
