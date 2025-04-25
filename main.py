@@ -13,6 +13,17 @@ if TELNYX_PUBLIC_KEY:
 
 app = FastAPI()
 
+# Create DB pool on startup and close on shutdown
+
+@app.on_event("startup")
+async def startup_event():
+    await db.get_pool()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    pool = await db.get_pool()
+    await pool.close()
+
 @app.post("/v1/sms/telnyx", response_class=PlainTextResponse)
 async def telnyx_webhook(request: Request):
     raw_body  = await request.body()
