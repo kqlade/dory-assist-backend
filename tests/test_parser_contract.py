@@ -3,29 +3,23 @@ import json
 
 import pytest
 
-from app.types.parser_contract import ParserReply, EntityDraft
+from app.types.parser_contract import ReminderReply, ReminderTask
 from app.services import parser_agent
 
 
-def test_parser_reply_round_trip():
+def test_reminder_reply_round_trip():
     data = {
-        "intent": "save",
-        "confidence": 0.85,
         "need_clarification": False,
-        "entities": [
-            {
-                "type": "place",
-                "name": "Chez Janou",
-                "city": "Paris",
-                "tags": ["Restaurant", "France"],
-                "needs_resolution": True,
-            }
-        ],
+        "reminder": {
+            "user_id": "u1",
+            "reminder_text": "Pay rent",
+            "reminder_time": "2030-01-01T09:00:00Z",
+            "timezone": "UTC",
+        },
     }
-    obj = ParserReply.parse_obj(data)
-    cloned = ParserReply.parse_raw(obj.json())
-    assert cloned.intent == "save"
-    assert cloned.entities[0].tags == ["restaurant", "france"]
+    obj = ReminderReply.model_validate(data)
+    cloned = ReminderReply.model_validate_json(obj.model_dump_json())
+    assert cloned.reminder and cloned.reminder.reminder_text == "Pay rent"
 
 
 @pytest.mark.asyncio
@@ -43,5 +37,5 @@ async def test_parser_agent_stub(monkeypatch):
     }
 
     reply = await parser_agent.run(envelope, ocr_text=None)
-    assert reply.intent == "save"
-    assert reply.confidence > 0.0
+    assert not reply.need_clarification
+    assert isinstance(reply.reminder, ReminderTask)

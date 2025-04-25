@@ -9,6 +9,7 @@ layers.
 from __future__ import annotations
 
 from typing import List, Literal, Optional
+from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -69,18 +70,9 @@ class ReminderTask(BaseModel):
     """The contract for a time-based reminder task, as required by the reminder worker."""
     user_id: str
     reminder_text: str
-    reminder_time: str  # ISO8601 timestamp, e.g. '2024-06-28T09:00:00'
+    reminder_time: datetime  # Parsed datetime; ISO8601 strings are accepted and auto-parsed by Pydantic
     timezone: str       # Olson timezone string, e.g. 'America/New_York'
     channel: str = "sms"  # Delivery channel, default to 'sms'
-
-    @field_validator("reminder_time")
-    def validate_reminder_time(cls, v):
-        from datetime import datetime
-        try:
-            datetime.fromisoformat(v)
-        except ValueError:
-            raise ValueError("reminder_time must be a valid ISO8601 timestamp")
-        return v
 
     @field_validator("timezone")
     def validate_timezone(cls, v):
@@ -101,4 +93,10 @@ class ReminderTask(BaseModel):
     def validate_channel(cls, v):
         if v != "sms":
             raise ValueError("channel must be 'sms'")
+        return v
+
+    @field_validator("reminder_time")
+    def validate_reminder_time(cls, v: datetime):
+        if not isinstance(v, datetime):
+            raise ValueError("reminder_time must be a datetime instance")
         return v

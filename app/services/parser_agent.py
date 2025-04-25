@@ -1,7 +1,8 @@
 """
 LLM-powered Parser/Planner agent.
 
-Converts an SMS/MMS "Envelope" + optional OCR text into a ParserReply.
+Converts an SMS/MMS "Envelope" + optional OCR text into a ParserReply (or the
+more specific ReminderReply when operating in reminders-only mode).
 
 Author: <you>
 """
@@ -185,22 +186,27 @@ async def _call_openai(messages: List[ChatCompletionMessageParam]) -> str:
 
 async def run(envelope: Dict[str, Any], ocr_text: str | None = None) -> ReminderReply:
     """
-    Parse an MMS/SMS envelope + optional OCR into a structured ParserReply.
+    Parse an MMS/SMS envelope + optional OCR into a structured ReminderReply.
 
     Raises:
-        ValueError: if LLM output cannot be parsed into ParserReply
+        ValueError: if LLM output cannot be parsed into ReminderReply
     """
 
-    if not _OPENAI_API_KEY:
-        # Fallback stub for local dev without API key: create a dummy reminder 1 hour ahead
-        ts = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
-        dummy = ReminderTask(
+    # Check for OpenAI credentials at call-time (tests may manipulate env)
+    if not os.getenv("OPENAI_API_KEY"):
+        # When no OpenAI key (local dev), create a dummy reminder 1 hour in the future
+        reminder_dt = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+        dummy_reminder = ReminderTask(
             user_id=envelope.get("user_id", "unknown"),
             reminder_text=envelope.get("instruction", "todo"),
-            reminder_time=ts,
+            reminder_time=reminder_dt,
             timezone="UTC",
         )
-        return ReminderReply(need_clarification=False, reminder=dummy)
+
+        return ReminderReply(
+            need_clarification=False,
+            reminder=dummy_reminder,
+        )
 
     messages = _build_messages(envelope, ocr_text)
 
