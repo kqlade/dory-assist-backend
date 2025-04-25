@@ -97,7 +97,20 @@ async def telnyx_webhook(request: Request):
     # 2.1 Capture Telnyx media URLs directly (no re-hosting)
     images = [{"external_url": m["url"]} for m in payload.get("media", [])]
 
-    # 3. Build and store your envelope row (replace the pseudo insert with your actual DB operation)
+    # 3a. If user has an envelope awaiting clarification treat this text as the answer
+    awaiting = await db.fetch_awaiting_envelope(from_num)
+    if awaiting:
+        merged_instruction = f"{awaiting['instruction']} {text.strip()}".strip()
+        updated = await db.apply_clarification(awaiting["envelope_id"], merged_instruction)
+        # Re-queue parsing
+        celery_app.send_task(
+            "app.workers.parser.handle_envelope",
+            args=[updated],
+            queue="parse",
+        )
+        return PlainTextResponse("CLARIFICATION_RECEIVED", status_code=200)
+
+    # 3b. Otherwise build a fresh envelope row
     UTC = datetime.timezone.utc
     envelope = {
         "envelope_id": str(uuid.uuid4()),

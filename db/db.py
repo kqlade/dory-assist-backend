@@ -284,3 +284,40 @@ async def claim_due_reminders(limit: int = 100):
             limit,
         )
     return [dict(r) for r in rows]
+
+# ──────────────────────────────────────────────
+# Clarification helpers
+# ──────────────────────────────────────────────
+
+async def fetch_awaiting_envelope(user_id: str):
+    """Return latest envelope awaiting clarification for a user, or None."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM message_envelopes
+            WHERE user_id=$1 AND status='awaiting_user'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            user_id,
+        )
+    return dict(row) if row else None
+
+async def apply_clarification(envelope_id: str, new_instruction: str):
+    """Update instruction + reset status to 'received'. Return updated row."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE message_envelopes
+            SET instruction=$2, status='received'
+            WHERE envelope_id=$1
+            """,
+            envelope_id,
+            new_instruction,
+        )
+        row = await conn.fetchrow(
+            "SELECT * FROM message_envelopes WHERE envelope_id=$1", envelope_id
+        )
+    return dict(row)

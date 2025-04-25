@@ -1,5 +1,5 @@
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import Column, String, Integer, DateTime, Text, JSON
+from sqlalchemy import Column, String, Integer, DateTime, Text, JSON, Index
 
 Base = declarative_base()
 
@@ -26,4 +26,7 @@ class MessageEnvelope(Base):
     payload = Column(JSON)
     raw_refs = Column(JSON)
     status = Column(String, nullable=False, default="received")
-    created_at = Column(DateTime) 
+    created_at = Column(DateTime)
+    __table_args__ = (
+        Index("ix_message_envelopes_status", "status"),
+    ) 
