@@ -32,12 +32,14 @@ async def telnyx_webhook(request: Request):
 
     # 1. Verify webhook authenticity (raises if bad)
     try:
-        telnyx.verify_webhook_signature(raw_body, signature, ts)
-    except telnyx.error.SignatureVerificationError:
+        event = telnyx.Webhook.construct_event(
+            raw_body.decode("utf-8"), signature, ts, TELNYX_PUBLIC_KEY
+        )
+    except (ValueError, telnyx.error.SignatureVerificationError):
         raise HTTPException(status_code=400, detail="Bad signature")
 
     # 2. Extract sender & text (Telnyx v2 JSON payload structure)
-    payload = (await request.json())["data"]["payload"]
+    payload = event.data["payload"]
     from_num = payload["from"]["phone_number"]
     text     = payload["text"]
 
