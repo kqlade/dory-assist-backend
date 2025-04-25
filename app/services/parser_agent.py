@@ -52,11 +52,11 @@ async def _call_openai(messages: list[dict[str, str]]) -> str:
     response = await client.chat.completions.create(
         model=MODEL,
         messages=messages,
-        functions=[FUNCTION_DEF],
-        function_call="auto",
+        tools=[{"type": "function", "function": FUNCTION_DEF}],
+        tool_choice="auto",
         temperature=0.2,
     )
-    return response.choices[0].message.function_call.arguments
+    return response.choices[0].message.tool_calls[0].function.arguments
 
 
 async def run(envelope: Dict[str, Any], ocr_text: str | None = None) -> ParserReply:
