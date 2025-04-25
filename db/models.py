@@ -8,13 +8,13 @@ class Reminder(Base):
     reminder_id = Column(String, primary_key=True)
     user_id = Column(String, nullable=False)
     reminder_text = Column(Text, nullable=False)
-    reminder_time = Column(DateTime)
+    reminder_time = Column(DateTime(timezone=True))
     timezone = Column(String)
     channel = Column(String, nullable=False, default="sms")
     status = Column(String, nullable=False, default="pending")
     last_error = Column(Text)
     created_at = Column(DateTime)
-    updated_at = Column(DateTime)
+    updated_at = Column(DateTime(timezone=True))
     payload = Column(JSON)
 
 class MessageEnvelope(Base):
