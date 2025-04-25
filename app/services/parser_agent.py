@@ -17,7 +17,7 @@ from app.types.parser_contract import ParserReply
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "o4-mini")
 
-openai.api_key = OPENAI_API_KEY
+client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 SYSTEM_PROMPT = (
     "You are a planning assistant that converts user SMS/MMS into structured "
@@ -31,15 +31,32 @@ TEXT_TEMPLATE = (
     "Respond with JSON per the schema."
 )
 
+FUNCTION_DEF = {
+    "name": "parse_sms",
+    "description": "Extract structured intent and entities from an SMS/MMS envelope.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string", "description": "User intent label"},
+            "confidence": {"type": "number"},
+            "need_clarification": {"type": "boolean"},
+            "clarification_question": {"type": "string"},
+            "entities": {"type": "array", "items": {"type": "object"}},
+        },
+        "required": ["intent", "confidence"],
+    },
+}
+
 @retry(wait=wait_random_exponential(multiplier=1, max=30), stop=stop_after_attempt(3))
 async def _call_openai(messages: list[dict[str, str]]) -> str:
-    response = await openai.ChatCompletion.acreate(
+    response = await client.chat.completions.create(
         model=MODEL,
         messages=messages,
+        functions=[FUNCTION_DEF],
+        function_call="auto",
         temperature=0.2,
-        response_format={"type": "json_object"},
     )
-    return response.choices[0].message.content
+    return response.choices[0].message.function_call.arguments
 
 
 async def run(envelope: Dict[str, Any], ocr_text: str | None = None) -> ParserReply:
