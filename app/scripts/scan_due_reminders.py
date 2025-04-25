@@ -39,4 +39,9 @@ async def _process_row(row: dict) -> None:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    asyncio.run(main()) 
+    print("[CRON] scan_due_reminders: job started")
+    try:
+        asyncio.run(main())
+        print("[CRON] scan_due_reminders: job completed successfully")
+    except Exception as e:
+        print(f"[CRON] scan_due_reminders: job failed: {e}") 
