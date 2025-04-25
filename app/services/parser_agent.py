@@ -137,6 +137,20 @@ FUNCTIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_photo_metadata",
+            "description": "Return EXIF datetime, GPS and camera details for an image URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
 ]
 
 def _normalize_llm_json(raw: str) -> str:
@@ -267,6 +281,10 @@ async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam]) -> 
             elif name == "fetch_url_content":
                 from app.utils.web_fetch import fetch_url_content
                 payload = await fetch_url_content(args["url"], args.get("max_chars", 10000))
+            elif name == "fetch_photo_metadata":
+                from app.utils.photo_metadata import extract_photo_metadata
+                meta = await asyncio.to_thread(extract_photo_metadata, args["url"])
+                payload = json.dumps(meta)
             else:
                 payload = "{}"
             # Append tool response and loop
