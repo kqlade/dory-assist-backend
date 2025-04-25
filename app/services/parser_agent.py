@@ -26,7 +26,7 @@ from tenacity import (
     retry_if_exception_type,
 )
 
-from app.types.parser_contract import ReminderReply, ReminderTask
+from app.types.parser_contract import ReminderReply, ReminderTask, TimeTrigger
 
 # ──────────────────────────────────────────────────────────────────────────
 # Config
@@ -75,11 +75,10 @@ FUNCTION_DEF = {
                 "properties": {
                     "user_id": {"type": "string"},
                     "reminder_text": {"type": "string"},
-                    "reminder_time": {"type": "string"},
-                    "timezone": {"type": "string"},
+                    "triggers": {"type": "array", "items": {"type": "object"}},
                     "channel": {"type": "string", "enum": ["sms"]},
                 },
-                "required": ["user_id", "reminder_text", "reminder_time", "timezone"],
+                "required": ["user_id", "reminder_text", "triggers"],
             },
         },
         "required": ["need_clarification"],
@@ -154,7 +153,7 @@ async def _call_openai(messages: List[ChatCompletionMessageParam]) -> str:
         tools=[{"type": "function", "function": FUNCTION_DEF}],
         # Force the assistant to call the parse_sms function; if it cannot, the
         # OpenAI API will raise an error instead of silently returning text.
-        tool_choice={"type": "function", "function": {"name": "parse_sms"}},
+        tool_choice={"type": "function", "function": {"name": "parse_reminder"}},
         # temperature=0.2,
         timeout=_TIMEOUT,
     )
@@ -196,11 +195,11 @@ async def run(envelope: Dict[str, Any], ocr_text: str | None = None) -> Reminder
     if not os.getenv("OPENAI_API_KEY"):
         # When no OpenAI key (local dev), create a dummy reminder 1 hour in the future
         reminder_dt = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+        dummy_trigger = TimeTrigger(at=reminder_dt, timezone="UTC")
         dummy_reminder = ReminderTask(
             user_id=envelope.get("user_id", "unknown"),
             reminder_text=envelope.get("instruction", "todo"),
-            reminder_time=reminder_dt,
-            timezone="UTC",
+            triggers=[dummy_trigger],
         )
 
         return ReminderReply(

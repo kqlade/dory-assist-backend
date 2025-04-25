@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from app.types.parser_contract import ReminderReply, ReminderTask
+from app.types.parser_contract import ReminderReply, ReminderTask, TimeTrigger
 from app.services import parser_agent
 
 
@@ -13,8 +13,9 @@ def test_reminder_reply_round_trip():
         "reminder": {
             "user_id": "u1",
             "reminder_text": "Pay rent",
-            "reminder_time": "2030-01-01T09:00:00Z",
-            "timezone": "UTC",
+            "triggers": [
+                {"type": "time", "at": "2030-01-01T09:00:00Z", "timezone": "UTC"}
+            ],
         },
     }
     obj = ReminderReply.model_validate(data)

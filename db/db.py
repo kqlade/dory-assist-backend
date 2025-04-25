@@ -4,6 +4,7 @@ import asyncpg
 
 from uuid import uuid4
 from datetime import datetime, timezone
+from typing import Optional
 
 from app.types.parser_contract import ReminderTask
 
@@ -47,7 +48,32 @@ async def insert_envelope(envelope: dict):
 # ──────────────────────────────────────────────
 
 async def insert_reminder(task: ReminderTask):
-    """Insert a pending reminder row and return its generated UUID."""
+    """Insert a pending reminder row and return its generated UUID.
+
+    For backward compatibility, we retain `reminder_time` and `timezone` columns. If the
+    task contains at least one TimeTrigger, we use its `at` and `timezone`. Otherwise we
+    store NULL for those columns. The full task is stored in a JSONB `payload` column so
+    new trigger types are preserved.
+    """
+
+    # Extract first TimeTrigger if present (back-compat)
+    reminder_time: Optional[datetime] = None
+    timezone: Optional[str] = None
+    for trig in task.triggers:
+        if isinstance(trig, dict):
+            # triggers may come as dict pre-validation; but in runtime they are BaseModel
+            ttype = trig.get("type")
+        else:
+            ttype = getattr(trig, "type", None)
+
+        if ttype == "time":
+            if isinstance(trig, dict):
+                reminder_time = trig.get("at")
+                timezone = trig.get("timezone")
+            else:
+                reminder_time = trig.at  # type: ignore[attr-defined]
+                timezone = trig.timezone  # type: ignore[attr-defined]
+            break
 
     reminder_id = str(uuid4())
     pool = await get_pool()
@@ -56,15 +82,16 @@ async def insert_reminder(task: ReminderTask):
             """
             INSERT INTO reminders (
                 reminder_id, user_id, reminder_text, reminder_time, timezone, channel,
-                status, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, 'pending', NOW(), NOW())
+                payload, status, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'pending', NOW(), NOW())
             """,
             reminder_id,
             task.user_id,
             task.reminder_text,
-            task.reminder_time,
-            task.timezone,
+            reminder_time,
+            timezone,
             task.channel,
+            json.dumps(task.model_dump(mode="json")),
         )
 
     return reminder_id
@@ -119,13 +146,14 @@ async def create_reminders_table():
                 reminder_id   UUID PRIMARY KEY,
                 user_id       TEXT NOT NULL,
                 reminder_text TEXT NOT NULL,
-                reminder_time TIMESTAMPTZ NOT NULL,
-                timezone      TEXT NOT NULL,
+                reminder_time TIMESTAMPTZ,
+                timezone      TEXT,
                 channel       TEXT NOT NULL DEFAULT 'sms',
                 status        TEXT NOT NULL DEFAULT 'pending',
                 last_error    TEXT,
                 created_at    TIMESTAMPTZ DEFAULT NOW(),
-                updated_at    TIMESTAMPTZ DEFAULT NOW()
+                updated_at    TIMESTAMPTZ DEFAULT NOW(),
+                payload       JSONB
             );
             CREATE INDEX IF NOT EXISTS reminders_due_idx ON reminders (status, reminder_time);
             """

@@ -55,7 +55,14 @@ async def process_envelope_background(envelope: dict):
         return
 
     await db.insert_reminder(reply.reminder)
-    print("Reminder stored", reply.reminder.reminder_time)
+
+    # Log helpful debug of first time trigger if available
+    first_time = None
+    for trig in reply.reminder.triggers:
+        if getattr(trig, "type", None) == "time":
+            first_time = getattr(trig, "at", None)
+            break
+    print("Reminder stored", first_time or "(non-time trigger)")
 
 @app.post("/v1/sms/telnyx", response_class=PlainTextResponse)
 async def telnyx_webhook(request: Request):

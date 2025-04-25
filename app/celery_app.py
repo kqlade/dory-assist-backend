@@ -21,6 +21,14 @@ celery_app.conf.task_routes = {
     "app.workers.reminder.handle": {"queue": "reminder"},
 }
 
+# Beat schedule: dispatch due time-based reminders every minute
+celery_app.conf.beat_schedule = {
+    "dispatch-due-reminders": {
+        "task": "app.workers.reminder.dispatch_due",
+        "schedule": 60.0,
+    }
+}
+
 # --- Ensure tasks are registered ---
 import app.workers.entity_resolver
 import app.workers.reminder

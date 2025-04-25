@@ -8,7 +8,8 @@ layers.
 
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple, Union
+from typing_extensions import Annotated
 from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -40,6 +41,49 @@ class EntityDraft(BaseModel):
 # ──────────────────────────────
 
 
+class TimeTrigger(BaseModel):
+    """Trigger based on a specific moment in time."""
+
+    type: Literal["time"] = "time"
+    at: datetime
+    timezone: str
+
+    @field_validator("timezone")
+    def _validate_tz(cls, v):  # noqa: N805
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(v)
+        except Exception:
+            raise ValueError(f"timezone '{v}' is not a valid Olson timezone string")
+        return v
+
+
+class LocationPoint(BaseModel):
+    lat: float
+    lon: float
+
+
+class LocationTrigger(BaseModel):
+    """Trigger that fires when the user is within `radius_m` of *any* point."""
+
+    type: Literal["location"] = "location"
+    points: List[LocationPoint]
+    radius_m: int = 100  # default 100 m geofence
+    valid_from: Optional[datetime] = None
+    valid_to: Optional[datetime] = None
+
+
+class EventTrigger(BaseModel):
+    """Trigger relative to a calendar event by id + offset."""
+
+    type: Literal["event"] = "event"
+    calendar_event_id: str
+    offset_minutes: int  # negative → before, positive → after (0 = at)
+
+
+Trigger = Annotated[Union[TimeTrigger, LocationTrigger, EventTrigger], Field(discriminator="type")]
+
+
 class ReminderReply(BaseModel):
     """LLM response for reminders-only MVP.
 
@@ -67,36 +111,31 @@ class ReminderReply(BaseModel):
 
 
 class ReminderTask(BaseModel):
-    """The contract for a time-based reminder task, as required by the reminder worker."""
+    """The contract for a reminder task, supporting multiple trigger types."""
+
     user_id: str
     reminder_text: str
-    reminder_time: datetime  # Parsed datetime; ISO8601 strings are accepted and auto-parsed by Pydantic
-    timezone: str       # Olson timezone string, e.g. 'America/New_York'
+    triggers: List[Trigger]
     channel: str = "sms"  # Delivery channel, default to 'sms'
 
-    @field_validator("timezone")
-    def validate_timezone(cls, v):
-        try:
-            from zoneinfo import ZoneInfo
-            ZoneInfo(v)
-        except Exception:
-            raise ValueError(f"timezone '{v}' is not a valid Olson timezone string")
-        return v
-
+    # ------------------------------------------------------------------
+    # Validators
+    # ------------------------------------------------------------------
     @field_validator("user_id")
-    def validate_user_id(cls, v):
+    def validate_user_id(cls, v):  # noqa: N805
         if not isinstance(v, str) or not v.strip():
             raise ValueError("user_id must be a non-empty string")
         return v
 
     @field_validator("channel")
-    def validate_channel(cls, v):
+    def validate_channel(cls, v):  # noqa: N805
         if v != "sms":
             raise ValueError("channel must be 'sms'")
         return v
 
-    @field_validator("reminder_time")
-    def validate_reminder_time(cls, v: datetime):
-        if not isinstance(v, datetime):
-            raise ValueError("reminder_time must be a datetime instance")
-        return v
+    @model_validator(mode="after")
+    def _ensure_trigger(cls, model):  # noqa: N805
+        """Ensure at least one trigger is provided."""
+        if not getattr(model, "triggers", None):
+            raise ValueError("at least one trigger must be provided")
+        return model
