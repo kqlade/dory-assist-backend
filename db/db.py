@@ -259,3 +259,10 @@ async def apply_clarification(envelope_id: str, new_instruction: str):
             .values(instruction=new_instruction, status="received")
         )
         await s.commit()
+
+
+async def dispose_engine():
+    global _engine
+    if _engine is not None:
+        await _engine.dispose()
+        _engine = None

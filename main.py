@@ -3,11 +3,12 @@ import telnyx
 import uuid
 import datetime
 import asyncio
-from fastapi import FastAPI, Request, HTTPException, status
+from fastapi import FastAPI, Request, HTTPException, status, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 import db
 from config import TELNYX_PUBLIC_KEY
 from app.celery_app import celery_app
+from app.services import parser_agent
 
 # Background processing
 from app.services import parser_agent
@@ -27,7 +28,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    pass  # No explicit pool to close
+    await db.dispose_engine()
 
 # --------------------------------------------
 # Background task: parse envelope and enqueue
@@ -62,8 +63,11 @@ async def process_envelope_background(envelope: dict):
             break
     print("Reminder stored", first_time or "(non-time trigger)")
 
+# --------------------------------------------
+# Endpoint
+# --------------------------------------------
 @app.post("/v1/sms/telnyx", response_class=PlainTextResponse)
-async def telnyx_webhook(request: Request):
+async def telnyx_webhook(request: Request, background: BackgroundTasks):
     raw_body  = await request.body()
     sig = request.headers.get("telnyx-signature-ed25519")
     ts  = request.headers.get("telnyx-timestamp")
@@ -79,6 +83,9 @@ async def telnyx_webhook(request: Request):
     except Exception as e:
         raise HTTPException(400, "Bad signature")
 
+    if payload.get("type") == "ping":
+        return PlainTextResponse("PONG")
+
     # TelnyxObject -> dict if needed
     if hasattr(payload, "to_dict"):
         payload = payload.to_dict()
@@ -90,26 +97,17 @@ async def telnyx_webhook(request: Request):
     text     = payload.get("text", "")
 
     if not from_num:
-        # Not an inbound message we care about (e.g., DLR). Acknowledge and exit.
         return PlainTextResponse("IGNORED", status_code=status.HTTP_200_OK)
 
-    # 2.1 Capture Telnyx media URLs directly (no re-hosting)
     images = [{"external_url": m["url"]} for m in payload.get("media", [])]
 
-    # 3a. If user has an envelope awaiting clarification treat this text as the answer
-    awaiting = await db.fetch_awaiting_envelope(from_num)
+    awaiting = await db.latest_awaiting_envelope(from_num)
     if awaiting:
         merged_instruction = f"{awaiting['instruction']} {text.strip()}".strip()
         updated = await db.apply_clarification(awaiting["envelope_id"], merged_instruction)
-        # Re-queue parsing
-        celery_app.send_task(
-            "app.workers.parser.handle_envelope",
-            args=[updated],
-            queue="parse",
-        )
+        background.add_task(parser_agent.run_and_store, updated)
         return PlainTextResponse("CLARIFICATION_RECEIVED", status_code=200)
 
-    # 3b. Otherwise build a fresh envelope row
     UTC = datetime.timezone.utc
     envelope = {
         "envelope_id": str(uuid.uuid4()),
@@ -117,21 +115,12 @@ async def telnyx_webhook(request: Request):
         "channel": "sms",
         "instruction": text.strip(),
         "payload": {"images": images},
-        "created_at": datetime.datetime.now(tz=UTC)
+        "created_at": datetime.datetime.now(tz=UTC),
     }
-    # Store envelope in Postgres
     try:
         await db.insert_envelope(envelope)
-        # Dispatch parsing to Celery worker instead of in-process coroutine
-        celery_app.send_task(
-            "app.workers.parser.handle_envelope",
-            args=[envelope],
-            queue="parse",
-        )
+        background.add_task(parser_agent.run_and_store, envelope)
     except Exception as e:
-        # Log error but don't crash webhook
         print("DB insert failed:", e)
-        print("Envelope:", envelope)
-        raise HTTPException(status_code=500, detail="DB error")
-
-    return PlainTextResponse("OK", status_code=status.HTTP_200_OK)
+        raise HTTPException(500, "DB error")
+    return PlainTextResponse("OK")

@@ -9,4 +9,5 @@ from .db import (
     latest_awaiting_envelope,
     apply_clarification,
     create_all,
+    dispose_engine,
 )  # noqa: F401

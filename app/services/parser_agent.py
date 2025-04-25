@@ -1,8 +1,7 @@
 """
 LLM-powered Parser/Planner agent.
 
-Converts an SMS/MMS "Envelope" + optional OCR text into a ParserReply (or the
-more specific ReminderReply when operating in reminders-only mode).
+Converts an SMS/MMS *Envelope* into a `ReminderReply`.
 
 Author: <you>
 """
@@ -27,18 +26,19 @@ from tenacity import (
 )
 
 from app.types.parser_contract import ReminderReply, ReminderTask, TimeTrigger
+import db
 
 # ──────────────────────────────────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────────────────────────────────
 
-_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # Use a model that officially supports function/tool calling. Allow override via env.
 # As of 2024, o4-mini supports tool/function calling (see OpenAI/third-party docs).
-_MODEL          = os.getenv("OPENAI_MODEL", "o4-mini")
-_TIMEOUT        = float(os.getenv("OPENAI_TIMEOUT", "30"))
+OPENAI_MODEL          = os.getenv("OPENAI_MODEL", "o4-mini")
+OPENAI_TIMEOUT        = float(os.getenv("OPENAI_TIMEOUT", "30"))
 
-client = AsyncOpenAI(api_key=_OPENAI_API_KEY)
+_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,25 +46,23 @@ _LOGGER = logging.getLogger(__name__)
 # Prompts & function-tool definition
 # ──────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = (
-    "You are an intake assistant that extracts time-based reminders from user "
-    "SMS/MMS (text + images + links). Use ALL information in the envelope, "
-    "including image content, to infer the reminder details. "
-    "Return ONLY JSON that matches the provided schema. "
-    "If you can fully determine the reminder, set need_clarification=false and "
-    "fill the reminder object. Otherwise set need_clarification=true and provide "
-    "a single clarification_question asking for the missing info."
+_SYSTEM_PROMPT = (
+    "You are an intake assistant that extracts **time-based reminders** from "
+    "user SMS/MMS (text, images and links). "
+    "Return ONLY JSON that matches the given schema. "
+    "If anything is missing, set `need_clarification=true` and provide exactly "
+    "one `clarification_question`."
 )
 
-TEXT_TEMPLATE = (
+_TEXT_TEMPLATE = (
     "# Envelope\n{envelope}\n\n"
     "# OCR_Text\n{ocr}\n\n"
     "Respond with JSON per the schema."
 )
 
-FUNCTION_DEF = {
+_FUNCTION_DEF = {
     "name": "parse_reminder",
-    "description": "Extract a ReminderTask or clarification from an SMS/MMS envelope.",
+    "description": "Extract a ReminderTask or ask a single clarification question.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -89,7 +87,7 @@ FUNCTION_DEF = {
 INTENT_SYNONYMS: dict[str, str] = {}
 
 FUNCTIONS = [
-    {"type": "function", "function": FUNCTION_DEF},
+    {"type": "function", "function": _FUNCTION_DEF},
     {
         "type": "function",
         "function": {
@@ -153,19 +151,10 @@ FUNCTIONS = [
     },
 ]
 
-def _normalize_llm_json(raw: str) -> str:
-    """Fix common schema drift issues before Pydantic validation."""
-    try:
-        data = json.loads(raw)
-    except Exception:
-        # If already dict-like, just cast
-        if isinstance(raw, dict):
-            data = raw
-        else:
-            raise
-
-    # No special normalization needed for reminders-only MVP
-    return json.dumps(data)
+def _safe_truncate(obj: Any, max_chars: int = 2_000) -> str:
+    """Truncate JSON serialized object to max_chars."""
+    txt = json.dumps(obj, ensure_ascii=False)
+    return txt if len(txt) <= max_chars else txt[: max_chars] + " …truncated…"
 
 # ──────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -177,20 +166,26 @@ class Envelope(TypedDict, total=False):
     payload: Dict[str, Any]
 
 
-def _build_messages(envelope: Envelope, ocr_text: str | None) -> List[ChatCompletionMessageParam]:
-    """Compose the multimodal message list for Chat Completions."""
-    user_content: List[Dict[str, Any]] = [
-        {"type": "text", "text": TEXT_TEMPLATE.format(envelope=envelope, ocr=ocr_text or "")}
+def _build_messages(env: Dict[str, Any], ocr_text: str | None = None) -> List[ChatCompletionMessageParam]:
+    """Compose a multimodal message list for Chat Completions."""
+    pruned_env = {
+        "from": env.get("user_id"),
+        "body": env.get("body", "")[:280] if "body" in env else env.get("instruction", "")[:280],
+        "images": [img.get("url") or img.get("external_url") for img in env.get("images", [])],
+        "timestamp": env.get("timestamp"),
+    }
+    user_payload: List[Dict[str, Any]] = [
+        {"type": "text", "text": _TEXT_TEMPLATE.format(
+            envelope=_safe_truncate(pruned_env), ocr=""
+        )}
     ]
-
-    for img in envelope.get("payload", {}).get("images", []):
-        url = img.get("external_url") or img.get("url")
+    for url in pruned_env["images"]:
         if url:
-            user_content.append({"type": "image_url", "image_url": {"url": url}})
+            user_payload.append({"type": "image_url", "image_url": {"url": url}})
 
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user",   "content": user_payload},
     ]
 
 
@@ -209,50 +204,34 @@ RETRY_ERRORS = (
     retry=retry_if_exception_type(RETRY_ERRORS),
 )
 async def _call_openai(messages: List[ChatCompletionMessageParam]) -> str:
-    """Low-level OpenAI call, returns the raw JSON string from tool arguments."""
-
-    response = await client.chat.completions.create(
-        model=_MODEL,
+    """Call OpenAI with the parse_reminder tool and return JSON string."""
+    rsp = await _client.chat.completions.create(
+        model=OPENAI_MODEL,
         messages=messages,
-        tools=[{"type": "function", "function": FUNCTION_DEF}],
-        # Force the assistant to call the parse_sms function; if it cannot, the
-        # OpenAI API will raise an error instead of silently returning text.
+        tools=[{"type": "function", "function": _FUNCTION_DEF}],
         tool_choice={"type": "function", "function": {"name": "parse_reminder"}},
-        # temperature=0.2,
-        timeout=_TIMEOUT,
+        timeout=OPENAI_TIMEOUT,
     )
-
-    tool_calls = response.choices[0].message.tool_calls
-
-    if tool_calls:
-        args = tool_calls[0].function.arguments
-        # openai-python returns str; but if it ever returns dict, handle gracefully
-        return args if isinstance(args, str) else json.dumps(args)
-
-    # ──────────────────────────────────────────────
-    # Fallback: assistant replied with raw JSON text
-    # (This should not happen with the enforced tool_choice, but we keep it as
-    # an additional guardrail for forward compatibility.)
-    # ──────────────────────────────────────────────
-    content = response.choices[0].message.content or ""
-    try:
-        # Validate by round-tripping through json
-        json.loads(content)
-        return content  # type: ignore[return-value]
-    except Exception:
-        raise ValueError("LLM did not invoke the parse_sms tool and fallback JSON parse failed")
+    msg = rsp.choices[0].message
+    
+    # Get JSON either from tool arguments or message content
+    if msg.tool_calls:
+        return msg.tool_calls[0].function.arguments
+    
+    # Fallback to content if no tool call (shouldn't happen with tool_choice specified)
+    return msg.content or ""
 
 
 async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam]) -> str:
     """Loop calling OpenAI, executing tools until we get parse_reminder."""
     max_iters = 3
     for _ in range(max_iters):
-        response = await client.chat.completions.create(
-            model=_MODEL,
+        response = await _client.chat.completions.create(
+            model=OPENAI_MODEL,
             messages=messages,
             tools=FUNCTIONS,
             tool_choice={"type": "function", "function": {"name": "parse_reminder"}},
-            timeout=_TIMEOUT,
+            timeout=OPENAI_TIMEOUT,
         )
         msg = response.choices[0].message
         if msg.tool_calls:
@@ -261,16 +240,14 @@ async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam]) -> 
             args = json.loads(call.function.arguments)
             # Execute tool
             if name == "lookup_reminders":
-                from db import search_reminders  # local import to avoid cycles
-                results = await search_reminders(
+                results = await db.search_reminders(
                     user_id=args["user_id"],
                     keyword=args.get("keyword"),
                     limit=args.get("limit", 5),
                 )
                 payload = json.dumps(results)
             elif name == "lookup_envelopes":
-                from db import search_envelopes
-                results = await search_envelopes(
+                results = await db.search_envelopes(
                     user_id=args["user_id"],
                     keyword=args.get("keyword"),
                     limit=args.get("limit", 5),
@@ -299,42 +276,36 @@ async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam]) -> 
 # Public entry-point
 # ──────────────────────────────────────────────────────────────────────────
 
-async def run(envelope: Dict[str, Any], ocr_text: str | None = None) -> ReminderReply:
+async def run(envelope: Dict[str, Any]) -> ReminderReply:
     """
-    Parse an MMS/SMS envelope + optional OCR into a structured ReminderReply.
+    Parse an MMS/SMS envelope into a structured `ReminderReply`.
 
-    Raises:
-        ValueError: if LLM output cannot be parsed into ReminderReply
+    Falls back to a dummy "one-off in 1 h" reminder if no OpenAI key present.
     """
-
-    # Check for OpenAI credentials at call-time (tests may manipulate env)
-    if not os.getenv("OPENAI_API_KEY"):
-        # When no OpenAI key (local dev), create a dummy reminder 1 hour in the future
-        reminder_dt = datetime.now(tz=timezone.utc) + timedelta(hours=1)
-        dummy_trigger = TimeTrigger(at=reminder_dt, timezone="UTC")
-        dummy_reminder = ReminderTask(
-            user_id=envelope.get("user_id", "unknown"),
-            reminder_text=envelope.get("instruction", "todo"),
-            triggers=[dummy_trigger],
-        )
-
+    if not OPENAI_API_KEY:
+        # local dev shortcut
+        dt = datetime.now(timezone.utc) + timedelta(hours=1)
         return ReminderReply(
             need_clarification=False,
-            reminder=dummy_reminder,
+            reminder=ReminderTask(
+                user_id=envelope.get("user_id", "unknown"),
+                reminder_text=envelope.get("body", envelope.get("instruction", "todo")),
+                triggers=[TimeTrigger(at=dt, timezone="UTC")],
+            ),
         )
 
-    messages = _build_messages(envelope, ocr_text)
-
-    raw_json = ""
     try:
-        raw_json = await _run_openai_with_tools(messages)
-        return ReminderReply.model_validate_json(_normalize_llm_json(raw_json))
-    except Exception as e:
-        # Attach raw json for debugging, if any
-        msg = f"Failed to get/parse LLM JSON: {e}"
-        if raw_json:
-            msg += f"\nRAW: {raw_json}"
-        raise ValueError(msg) from e
+        msgs = _build_messages(envelope)
+        raw_json = await _call_openai(msgs)
+        
+        # Validate by parsing then re-serializing to ensure proper JSON
+        parsed_data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+        normalized_json = json.dumps(parsed_data, ensure_ascii=False)
+        
+        return ReminderReply.model_validate_json(normalized_json)
+    except Exception as exc:
+        _LOGGER.warning("Failed to parse assistant output: %s", exc)
+        raise ValueError("Unable to interpret LLM output") from exc
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -353,3 +324,17 @@ if __name__ == "__main__":
     ocr = "Buy 2 tickets for Friday at 7 pm"
 
     pprint.pp(asyncio.run(run(dummy_env, ocr)))
+
+# ─────────────────────────── background helper ─────────────────────── #
+
+async def run_and_store(envelope: Dict[str, Any]):
+    """
+    Run the parser and store the reminder if found.
+    """
+    try:
+        reply = await run(envelope)
+        if not reply.need_clarification and reply.reminder:
+            await db.insert_reminder(reply.reminder)
+        # else: could send clarification SMS here if needed
+    except Exception as exc:
+        _LOGGER.error(f"run_and_store failed: {exc}")
