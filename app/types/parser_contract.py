@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 Intent = Literal["save", "reminder", "both", "unknown"]
 
@@ -49,17 +49,20 @@ class ReminderReply(BaseModel):
     clarification_question: Optional[str] = None
     reminder: Optional[ReminderTask] = None
 
-    @field_validator("clarification_question")
-    def _clarification_present_if_needed(cls, v, values):  # noqa: N805
-        if values.get("need_clarification") and (v is None or not v.strip()):
-            raise ValueError("clarification_question must be provided when need_clarification is True")
-        return v
+    @model_validator(mode="after")
+    def _cross_field_checks(self):  # noqa: N805
+        """Ensure logical consistency between fields.
 
-    @field_validator("reminder")
-    def _reminder_present_if_no_clarification(cls, v, values):  # noqa: N805
-        if not values.get("need_clarification") and v is None:
-            raise ValueError("reminder must be provided when no clarification is needed")
-        return v
+        • If clarification is required, there must be a non-empty clarification_question
+        • If no clarification is required, a reminder object must be supplied
+        """
+        if self.need_clarification:
+            if not self.clarification_question or not self.clarification_question.strip():
+                raise ValueError("clarification_question must be provided when need_clarification is True")
+        else:
+            if self.reminder is None:
+                raise ValueError("reminder must be provided when no clarification is needed")
+        return self
 
 
 class ReminderTask(BaseModel):
