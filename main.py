@@ -4,7 +4,7 @@ import uuid
 import datetime
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import PlainTextResponse
-
+import db
 from config import TELNYX_PUBLIC_KEY
 
 # Configure telnyx public key
@@ -42,8 +42,13 @@ async def telnyx_webhook(request: Request):
         "payload": {"images": images},
         "created_at": datetime.datetime.utcnow().isoformat()
     }
-    # Replace this with your actual DB insert call
-    # db.insert_envelope(envelope)
-    print("Storing envelope:", envelope)
+    # Store envelope in Postgres
+    try:
+        await db.insert_envelope(envelope)
+    except Exception as e:
+        # Log error but don't crash webhook
+        print("DB insert failed:", e)
+        print("Envelope:", envelope)
+        raise HTTPException(status_code=500, detail="DB error")
 
     return "OK", status.HTTP_200_OK
