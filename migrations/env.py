@@ -2,7 +2,7 @@
 Alembic environment file – async-ready (SQLAlchemy ≥2.0)
 
 Reads DATABASE_URL from the environment (or alembic.ini fallback),
-imports Base from *app/db/db.py*, and supports both offline (DDL script
+imports Base from *db/db.py*, and supports both offline (DDL script
 generation) and online (direct DB) modes.
 """
 
@@ -27,7 +27,7 @@ if config.config_file_name is not None:
 # ---------------------------------------------------------------------
 # 2. Model metadata
 # ---------------------------------------------------------------------
-from app.db.db import Base          # ← new, correct path
+from db.db import Base          # ← corrected path
 target_metadata = Base.metadata
 
 # ---------------------------------------------------------------------
@@ -35,11 +35,23 @@ target_metadata = Base.metadata
 # ---------------------------------------------------------------------
 def _database_url() -> str:
     """Determine the connection string Alembic should use."""
-    return (
+    url = (
         os.getenv("DATABASE_URL")
         or os.getenv("DATABASE_PUBLIC_URL")
         or config.get_main_option("sqlalchemy.url")
     )
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL not set and sqlalchemy.url missing from alembic.ini"
+        )
+
+    # add async driver only if not present already
+    if "+asyncpg" not in url:
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif url.startswith("postgresql://"):
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
 
 # ---------------------------------------------------------------------
 # 4. Offline migrations (generate SQL only)
@@ -60,8 +72,7 @@ def run_migrations_offline() -> None:
 # 5. Online migrations (run against DB) – async
 # ---------------------------------------------------------------------
 def _make_async_engine() -> AsyncEngine:
-    url = URL.create(_database_url())
-    return create_async_engine(url, poolclass=pool.NullPool, future=True)
+    return create_async_engine(_database_url(), poolclass=pool.NullPool, future=True)
 
 async def run_migrations_online() -> None:
     engine = _make_async_engine()
@@ -73,7 +84,7 @@ async def run_migrations_online() -> None:
                 target_metadata=target_metadata,
             )
         )
-        await conn.run_sync(context.run_migrations)
+        await conn.run_sync(lambda _: context.run_migrations())
 
     await engine.dispose()
 

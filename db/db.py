@@ -9,11 +9,11 @@ import os
 import json
 import asyncio
 from datetime import datetime, timezone
-from typing import Sequence, TypedDict, Any
+from typing import Sequence, TypedDict, Any, AsyncGenerator
 from uuid import uuid4
 
 from sqlalchemy import (
-    text, select, update, func
+    text, select, update, func, JSON
 )
 from sqlalchemy.orm import (
     DeclarativeBase, Mapped, mapped_column
@@ -25,29 +25,45 @@ from sqlalchemy.ext.asyncio import (
 from app.types.parser_contract import ReminderTask
 
 # ──────────────────────────────────────────────────────────────────────
-# 1. Engine & session factory
+# 1. Declarative metadata
 # ──────────────────────────────────────────────────────────────────────
-
-DATABASE_URL = os.environ["DATABASE_PUBLIC_URL"].replace("postgres://", "postgresql+asyncpg://")
-
-engine = create_async_engine(
-    DATABASE_URL,
-    pool_size=5,
-    max_overflow=5,
-    pool_timeout=60,
-)
-
-Session: async_sessionmaker[AsyncSession] = async_sessionmaker(
-    engine, expire_on_commit=False
-)
-
-# ──────────────────────────────────────────────────────────────────────
-# 2. ORM models
-# ──────────────────────────────────────────────────────────────────────
-
 class Base(DeclarativeBase):
     pass
 
+# ──────────────────────────────────────────────────────────────────────
+# 2. Lazy engine / session factory
+# ──────────────────────────────────────────────────────────────────────
+_engine = None
+_session_maker: async_sessionmaker[AsyncSession] | None = None
+
+def _build_url() -> str:
+    url = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL not set")
+    if "+asyncpg" not in url:
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1).replace(
+            "postgresql://", "postgresql+asyncpg://", 1
+        )
+    return url
+
+def get_engine():
+    global _engine
+    if _engine is None:
+        _engine = create_async_engine(_build_url(), pool_size=5, max_overflow=5)
+    return _engine
+
+def get_session() -> AsyncGenerator[AsyncSession, None]:
+    global _session_maker
+    if _session_maker is None:
+        _session_maker = async_sessionmaker(get_engine(), expire_on_commit=False)
+    async def _session_scope():
+        async with _session_maker() as session:
+            yield session
+    return _session_scope()
+
+# ──────────────────────────────────────────────────────────────────────
+# 3. ORM models
+# ──────────────────────────────────────────────────────────────────────
 
 class Reminder(Base):
     __tablename__ = "reminders"
@@ -59,7 +75,7 @@ class Reminder(Base):
     status:       Mapped[str]  = mapped_column(default="pending")
     next_fire_at: Mapped[datetime | None]
     last_error:   Mapped[str | None]
-    payload:      Mapped[dict[str, Any]]
+    payload:      Mapped[dict[str, Any]] = mapped_column(JSON)
     created_at:   Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at:   Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()
@@ -73,24 +89,24 @@ class MessageEnvelope(Base):
     user_id:     Mapped[str | None]
     channel:     Mapped[str | None]
     instruction: Mapped[str]
-    payload:     Mapped[dict[str, Any] | None]
+    payload:     Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status:      Mapped[str]   = mapped_column(default="received")
     created_at:  Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 3. DDL helper (run once at startup or from Alembic)
+# 4. DDL helper (run once at startup or from Alembic)
 # ──────────────────────────────────────────────────────────────────────
 async def create_all():
-    async with engine.begin() as conn:
+    async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 4. CRUD helpers
+# 5. CRUD helpers
 # ──────────────────────────────────────────────────────────────────────
 
-# 4.1 Insert envelope --------------------------------------------------
+# 5.1 Insert envelope --------------------------------------------------
 async def insert_envelope(envelope: dict):
     env = MessageEnvelope(
         envelope_id=envelope["envelope_id"],
@@ -101,12 +117,12 @@ async def insert_envelope(envelope: dict):
         status=envelope.get("status", "received"),
         created_at=envelope.get("created_at", datetime.now(timezone.utc)),
     )
-    async with Session() as s:
+    async for s in get_session():
         s.add(env)
         await s.commit()
 
 
-# 4.2 Insert reminder --------------------------------------------------
+# 5.2 Insert reminder --------------------------------------------------
 def _first_time_trigger(task: ReminderTask) -> datetime | None:
     for trg in task.triggers:
         if trg.type == "time":
@@ -125,15 +141,15 @@ async def insert_reminder(task: ReminderTask) -> str:
         next_fire_at=_first_time_trigger(task),
         payload=json.loads(task.model_dump_json()),
     )
-    async with Session() as s:
+    async for s in get_session():
         s.add(reminder)
         await s.commit()
     return rid
 
 
-# 4.3 Claim due reminders ---------------------------------------------
+# 5.3 Claim due reminders ---------------------------------------------
 async def claim_due_reminders(limit: int = 100) -> list[Reminder]:
-    async with Session() as s:
+    async for s in get_session():
         stmt = (
             update(Reminder)
             .where(
@@ -150,9 +166,9 @@ async def claim_due_reminders(limit: int = 100) -> list[Reminder]:
         return res.scalars().all()
 
 
-# 4.4 mark_sent / mark_failed -----------------------------------------
+# 5.4 mark_sent / mark_failed -----------------------------------------
 async def mark_reminder_sent(rid: str):
-    async with Session() as s:
+    async for s in get_session():
         await s.execute(
             update(Reminder)
             .where(Reminder.reminder_id == rid)
@@ -162,7 +178,7 @@ async def mark_reminder_sent(rid: str):
 
 
 async def mark_reminder_failed(rid: str, err: str):
-    async with Session() as s:
+    async for s in get_session():
         await s.execute(
             update(Reminder)
             .where(Reminder.reminder_id == rid)
@@ -171,7 +187,7 @@ async def mark_reminder_failed(rid: str, err: str):
         await s.commit()
 
 
-# 4.5 Search helpers ---------------------------------------------------
+# 5.5 Search helpers ---------------------------------------------------
 async def search_reminders(
     user_id: str,
     keyword: str | None = None,
@@ -179,7 +195,7 @@ async def search_reminders(
     end: datetime | None = None,
     limit: int = 10,
 ) -> list[dict]:
-    async with Session() as s:
+    async for s in get_session():
         stmt = select(Reminder).where(Reminder.user_id == user_id)
 
         if keyword:
@@ -202,7 +218,7 @@ async def search_envelopes(
     end: datetime | None = None,
     limit: int = 10,
 ) -> list[dict]:
-    async with Session() as s:
+    async for s in get_session():
         stmt = select(MessageEnvelope).where(MessageEnvelope.user_id == user_id)
 
         if keyword:
@@ -218,9 +234,9 @@ async def search_envelopes(
         return [e.__dict__ for e in res.scalars()]
 
 
-# 4.6 Envelope clarification helpers -----------------------------------
+# 5.6 Envelope clarification helpers -----------------------------------
 async def latest_awaiting_envelope(user_id: str) -> dict | None:
-    async with Session() as s:
+    async for s in get_session():
         stmt = (
             select(MessageEnvelope)
             .where(
@@ -236,7 +252,7 @@ async def latest_awaiting_envelope(user_id: str) -> dict | None:
 
 
 async def apply_clarification(envelope_id: str, new_instruction: str):
-    async with Session() as s:
+    async for s in get_session():
         await s.execute(
             update(MessageEnvelope)
             .where(MessageEnvelope.envelope_id == envelope_id)
