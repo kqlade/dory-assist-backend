@@ -4,3 +4,8 @@ requests
 telnyx
 uvicorn[standard]
 asyncpg
+openai
+tenacity
+pytest
+pytest-asyncio
+celery[redis]

@@ -2,10 +2,15 @@ import os
 import telnyx
 import uuid
 import datetime
+import asyncio
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import PlainTextResponse
 import db
 from config import TELNYX_PUBLIC_KEY
+from app.celery_app import celery_app
+
+# Background processing
+from app.services import parser_agent
 
 # Configure telnyx public key
 if TELNYX_PUBLIC_KEY:
@@ -23,6 +28,38 @@ async def startup_event():
 async def shutdown_event():
     pool = await db.get_pool()
     await pool.close()
+
+# --------------------------------------------
+# Background task: parse envelope and enqueue
+# --------------------------------------------
+
+async def process_envelope_background(envelope: dict):
+    """Parse envelope with LLM and push to appropriate queues."""
+    try:
+        reply = await parser_agent.run(envelope, ocr_text=None)
+    except Exception as exc:
+        # Don't bubble up; just log
+        print("Parser agent failed:", exc)
+        return
+
+    if reply.need_clarification:
+        # TODO: integrate SMS send & waiting state
+        print("Need clarification:", reply.clarification_question)
+        return
+
+    if reply.intent in ("save", "both"):
+        celery_app.send_task(
+            "app.workers.entity_resolver.handle_save",
+            args=[envelope, [e.dict() for e in reply.entities]],
+            queue="save",
+        )
+
+    if reply.intent in ("reminder", "both"):
+        celery_app.send_task(
+            "app.workers.reminder.handle",
+            args=[envelope, reply.dict()],
+            queue="reminder",
+        )
 
 @app.post("/v1/sms/telnyx", response_class=PlainTextResponse)
 async def telnyx_webhook(request: Request):
@@ -71,6 +108,8 @@ async def telnyx_webhook(request: Request):
     # Store envelope in Postgres
     try:
         await db.insert_envelope(envelope)
+        # Fire-and-forget background processing
+        asyncio.create_task(process_envelope_background(envelope))
     except Exception as e:
         # Log error but don't crash webhook
         print("DB insert failed:", e)
