@@ -27,19 +27,20 @@ async def shutdown_event():
 @app.post("/v1/sms/telnyx", response_class=PlainTextResponse)
 async def telnyx_webhook(request: Request):
     raw_body  = await request.body()
-    signature = request.headers.get("telnyx-signature-ed25519")
-    ts        = request.headers.get("telnyx-timestamp")
+    sig = request.headers.get("telnyx-signature-ed25519")
+    ts  = request.headers.get("telnyx-timestamp")
 
-    # 1. Verify webhook authenticity (raises if bad)
     try:
-        event = telnyx.Webhook.construct_event(
-            raw_body.decode("utf-8"), signature, ts, TELNYX_PUBLIC_KEY
-        )
-    except (ValueError, telnyx.error.SignatureVerificationError):
-        raise HTTPException(status_code=400, detail="Bad signature")
+        if TELNYX_PUBLIC_KEY:
+            event = telnyx.Webhook.construct_event(
+                raw_body.decode(), sig, ts
+            )
+            payload = event.data["payload"]
+        else:  # dev mode: skip signature verification
+            payload = (await request.json())["data"]["payload"]
+    except Exception:
+        raise HTTPException(400, "Bad signature")
 
-    # 2. Extract sender & text (Telnyx v2 JSON payload structure)
-    payload = event.data["payload"]
     from_num = payload["from"]["phone_number"]
     text     = payload["text"]
 
