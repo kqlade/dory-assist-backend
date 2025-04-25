@@ -204,12 +204,16 @@ async def run(envelope: Dict[str, Any], ocr_text: str | None = None) -> ParserRe
 
     messages = _build_messages(envelope, ocr_text)
 
+    raw_json = ""
     try:
         raw_json = await _call_openai(messages)
         return ParserReply.parse_raw(_normalize_llm_json(raw_json))
     except Exception as e:
-        # Attach raw json for debugging
-        raise ValueError(f"Failed to parse LLM JSON: {e}\nRAW: {raw_json}") from e
+        # Attach raw json for debugging, if any
+        msg = f"Failed to get/parse LLM JSON: {e}"
+        if raw_json:
+            msg += f"\nRAW: {raw_json}"
+        raise ValueError(msg) from e
 
 
 # ──────────────────────────────────────────────────────────────────────────
