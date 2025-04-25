@@ -20,3 +20,8 @@ celery_app.conf.task_routes = {
     "app.workers.entity_resolver.handle_save": {"queue": "save"},
     "app.workers.reminder.handle": {"queue": "reminder"},
 }
+
+# --- Ensure tasks are registered ---
+import app.workers.entity_resolver
+import app.workers.reminder
+
