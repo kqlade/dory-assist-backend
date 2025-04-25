@@ -1,328 +1,245 @@
+"""
+Async DB helpers for the reminders MVP.
+Uses SQLAlchemy 2.0 + asyncpg driver – no raw SQL strings in app code.
+"""
+
+from __future__ import annotations
+
 import os
 import json
-import asyncpg
-
-from uuid import uuid4
+import asyncio
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Sequence, TypedDict, Any
+from uuid import uuid4
+
+from sqlalchemy import (
+    text, select, update, func
+)
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column
+)
+from sqlalchemy.ext.asyncio import (
+    create_async_engine, async_sessionmaker, AsyncSession
+)
 
 from app.types.parser_contract import ReminderTask
 
-_pool = None
+# ──────────────────────────────────────────────────────────────────────
+# 1. Engine & session factory
+# ──────────────────────────────────────────────────────────────────────
 
-async def get_pool():
-    """Get (or create) a global asyncpg pool."""
-    global _pool
-    if _pool is None:
-        database_url = os.getenv("DATABASE_URL")
-        if not database_url:
-            raise RuntimeError("DATABASE_URL environment variable is not set")
-        _pool = await asyncpg.create_pool(database_url, min_size=1, max_size=5)
-    return _pool
+DATABASE_URL = os.environ["DATABASE_PUBLIC_URL"].replace("postgres://", "postgresql+asyncpg://")
 
+engine = create_async_engine(
+    DATABASE_URL,
+    pool_size=5,
+    max_overflow=5,
+    pool_timeout=60,
+)
+
+Session: async_sessionmaker[AsyncSession] = async_sessionmaker(
+    engine, expire_on_commit=False
+)
+
+# ──────────────────────────────────────────────────────────────────────
+# 2. ORM models
+# ──────────────────────────────────────────────────────────────────────
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Reminder(Base):
+    __tablename__ = "reminders"
+
+    reminder_id: Mapped[str]   = mapped_column(primary_key=True)
+    user_id:      Mapped[str]
+    reminder_text:Mapped[str]
+    channel:      Mapped[str]  = mapped_column(default="sms")
+    status:       Mapped[str]  = mapped_column(default="pending")
+    next_fire_at: Mapped[datetime | None]
+    last_error:   Mapped[str | None]
+    payload:      Mapped[dict[str, Any]]
+    created_at:   Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at:   Mapped[datetime] = mapped_column(
+        server_default=func.now(), onupdate=func.now()
+    )
+
+
+class MessageEnvelope(Base):
+    __tablename__ = "message_envelopes"
+
+    envelope_id: Mapped[str]   = mapped_column(primary_key=True)
+    user_id:     Mapped[str | None]
+    channel:     Mapped[str | None]
+    instruction: Mapped[str]
+    payload:     Mapped[dict[str, Any] | None]
+    status:      Mapped[str]   = mapped_column(default="received")
+    created_at:  Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 3. DDL helper (run once at startup or from Alembic)
+# ──────────────────────────────────────────────────────────────────────
+async def create_all():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 4. CRUD helpers
+# ──────────────────────────────────────────────────────────────────────
+
+# 4.1 Insert envelope --------------------------------------------------
 async def insert_envelope(envelope: dict):
-    """Insert an envelope row into message_envelopes table."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        created_at = envelope["created_at"]
-        if created_at.tzinfo is None:
-            raise ValueError("created_at datetime must be timezone-aware (UTC)")
-        # Normalize to UTC to avoid mix-type errors
-        created_at = created_at.astimezone(timezone.utc)
-        await conn.execute(
-            """
-            INSERT INTO message_envelopes (
-                envelope_id,
-                user_id,
-                channel,
-                instruction,
-                payload,
-                status,
-                created_at
-            ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
-            ON CONFLICT (envelope_id) DO NOTHING
-            """,
-            envelope["envelope_id"],
-            envelope["user_id"],
-            envelope["channel"],
-            envelope["instruction"],
-            json.dumps(envelope["payload"]),
-            envelope.get("status", "received"),
-            created_at,
-        )
+    env = MessageEnvelope(
+        envelope_id=envelope["envelope_id"],
+        user_id=envelope.get("user_id"),
+        channel=envelope.get("channel"),
+        instruction=envelope["instruction"],
+        payload=envelope.get("payload"),
+        status=envelope.get("status", "received"),
+        created_at=envelope.get("created_at", datetime.now(timezone.utc)),
+    )
+    async with Session() as s:
+        s.add(env)
+        await s.commit()
 
-# ──────────────────────────────────────────────
-# Reminder helpers
-# ──────────────────────────────────────────────
 
-async def insert_reminder(task: ReminderTask):
-    """Insert a pending reminder row and return its generated UUID.
+# 4.2 Insert reminder --------------------------------------------------
+def _first_time_trigger(task: ReminderTask) -> datetime | None:
+    for trg in task.triggers:
+        if trg.type == "time":
+            return trg.at
+    return None
 
-    For backward compatibility, we retain `reminder_time` and `timezone` columns. If the
-    task contains at least one TimeTrigger, we use its `at` and `timezone`. Otherwise we
-    store NULL for those columns. The full task is stored in a JSONB `payload` column so
-    new trigger types are preserved.
-    """
 
-    # Extract first TimeTrigger if present (back-compat)
-    reminder_time: Optional[datetime] = None
-    timezone: Optional[str] = None
-    for trig in task.triggers:
-        if isinstance(trig, dict):
-            # triggers may come as dict pre-validation; but in runtime they are BaseModel
-            ttype = trig.get("type")
-        else:
-            ttype = getattr(trig, "type", None)
+async def insert_reminder(task: ReminderTask) -> str:
+    rid = str(uuid4())
+    reminder = Reminder(
+        reminder_id=rid,
+        user_id=task.user_id,
+        reminder_text=task.reminder_text,
+        channel=task.channel,
+        status="pending",
+        next_fire_at=_first_time_trigger(task),
+        payload=json.loads(task.model_dump_json()),
+    )
+    async with Session() as s:
+        s.add(reminder)
+        await s.commit()
+    return rid
 
-        if ttype == "time":
-            if isinstance(trig, dict):
-                reminder_time = trig.get("at")
-                timezone = trig.get("timezone")
-            else:
-                reminder_time = trig.at  # type: ignore[attr-defined]
-                timezone = trig.timezone  # type: ignore[attr-defined]
-            break
 
-    reminder_id = str(uuid4())
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO reminders (
-                reminder_id, user_id, reminder_text, reminder_time, timezone, channel,
-                payload, status, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'pending', NOW(), NOW())
-            """,
-            reminder_id,
-            task.user_id,
-            task.reminder_text,
-            reminder_time,
-            timezone,
-            task.channel,
-            json.dumps(task.model_dump(mode="json")),
-        )
-
-    return reminder_id
-
-async def fetch_due_reminders(limit: int = 100):
-    """Return list of due pending reminders (dicts)."""
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT * FROM reminders
-            WHERE status = 'pending' AND reminder_time <= NOW()
-            ORDER BY reminder_time ASC
-            LIMIT $1
-            """,
-            limit,
-        )
-    return [dict(r) for r in rows]
-
-async def mark_reminder_sent(reminder_id: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE reminders
-            SET status='sent', updated_at=NOW()
-            WHERE reminder_id=$1
-            """,
-            reminder_id,
-        )
-
-async def mark_reminder_failed(reminder_id: str, error: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE reminders
-            SET status='failed', last_error=$2, updated_at=NOW()
-            WHERE reminder_id=$1
-            """,
-            reminder_id,
-            error,
-        )
-
-async def create_reminders_table():
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reminders (
-                reminder_id   UUID PRIMARY KEY,
-                user_id       TEXT NOT NULL,
-                reminder_text TEXT NOT NULL,
-                reminder_time TIMESTAMPTZ,
-                timezone      TEXT,
-                channel       TEXT NOT NULL DEFAULT 'sms',
-                status        TEXT NOT NULL DEFAULT 'pending',
-                last_error    TEXT,
-                created_at    TIMESTAMPTZ DEFAULT NOW(),
-                updated_at    TIMESTAMPTZ DEFAULT NOW(),
-                payload       JSONB
-            );
-            CREATE INDEX IF NOT EXISTS reminders_due_idx ON reminders (status, reminder_time);
-            """
-        )
-
-async def create_message_envelopes_table():
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS message_envelopes (
-                envelope_id  UUID PRIMARY KEY,
-                user_id      TEXT,
-                channel      TEXT CHECK (channel IN ('sms','mms','email')),
-                instruction  TEXT NOT NULL,
-                payload      JSONB,
-                raw_refs     JSONB,
-                status       TEXT NOT NULL DEFAULT 'received',
-                created_at   TIMESTAMPTZ DEFAULT now()
-            );
-            """
-        )
-
-async def search_reminders(user_id: str, keyword: str | None = None, start: datetime | None = None, end: datetime | None = None, limit: int = 10):
-    """Return recent reminders for a user matching optional keyword and date range."""
-    pool = await get_pool()
-    clauses = ["user_id = $1"]
-    params: list = [user_id]
-    idx = 2
-    if keyword:
-        clauses.append(f"reminder_text ILIKE ${idx}")
-        params.append(f"%{keyword}%")
-        idx += 1
-    if start:
-        clauses.append(f"created_at >= ${idx}")
-        params.append(start)
-        idx += 1
-    if end:
-        clauses.append(f"created_at <= ${idx}")
-        params.append(end)
-        idx += 1
-
-    where_sql = " AND ".join(clauses)
-
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT reminder_id, reminder_text, created_at, status
-            FROM reminders
-            WHERE {where_sql}
-            ORDER BY created_at DESC
-            LIMIT {limit}
-            """,
-            *params,
-        )
-    return [dict(r) for r in rows]
-
-async def search_envelopes(user_id: str, keyword: str | None = None, start: datetime | None = None, end: datetime | None = None, limit: int = 10):
-    """Return recent message envelopes for a user."""
-    pool = await get_pool()
-    clauses = ["user_id = $1"]
-    params: list = [user_id]
-    idx = 2
-    if keyword:
-        clauses.append(f"instruction ILIKE ${idx}")
-        params.append(f"%{keyword}%")
-        idx += 1
-    if start:
-        clauses.append(f"created_at >= ${idx}")
-        params.append(start)
-        idx += 1
-    if end:
-        clauses.append(f"created_at <= ${idx}")
-        params.append(end)
-        idx += 1
-
-    where_sql = " AND ".join(clauses)
-
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT envelope_id, instruction, created_at, payload
-            FROM message_envelopes
-            WHERE {where_sql}
-            ORDER BY created_at DESC
-            LIMIT {limit}
-            """,
-            *params,
-        )
-    return [dict(r) for r in rows]
-
-# ──────────────────────────────────────────────
-# New helpers
-# ──────────────────────────────────────────────
-
-async def update_envelope_status(envelope_id: str, status: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE message_envelopes
-            SET status=$2, created_at=created_at -- touch nothing else
-            WHERE envelope_id=$1
-            """,
-            envelope_id,
-            status,
-        )
-
-async def claim_due_reminders(limit: int = 100):
-    """Atomically set status='processing' and return claimed rows."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            WITH due AS (
-                SELECT reminder_id FROM reminders
-                WHERE status='pending' AND reminder_time <= NOW()
-                ORDER BY reminder_time ASC
-                LIMIT $1
+# 4.3 Claim due reminders ---------------------------------------------
+async def claim_due_reminders(limit: int = 100) -> list[Reminder]:
+    async with Session() as s:
+        stmt = (
+            update(Reminder)
+            .where(
+                Reminder.status == "pending",
+                Reminder.next_fire_at <= func.now()
             )
-            UPDATE reminders r SET status='processing', updated_at=NOW()
-            FROM due WHERE r.reminder_id = due.reminder_id
-            RETURNING r.*
-            """,
-            limit,
+            .values(status="processing", updated_at=func.now())
+            .returning(Reminder)
+            .order_by(Reminder.next_fire_at)
+            .limit(limit)
         )
-    return [dict(r) for r in rows]
+        res = await s.execute(stmt)
+        await s.commit()
+        return res.scalars().all()
 
-# ──────────────────────────────────────────────
-# Clarification helpers
-# ──────────────────────────────────────────────
 
-async def fetch_awaiting_envelope(user_id: str):
-    """Return latest envelope awaiting clarification for a user, or None."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT * FROM message_envelopes
-            WHERE user_id=$1 AND status='awaiting_user'
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            user_id,
+# 4.4 mark_sent / mark_failed -----------------------------------------
+async def mark_reminder_sent(rid: str):
+    async with Session() as s:
+        await s.execute(
+            update(Reminder)
+            .where(Reminder.reminder_id == rid)
+            .values(status="sent", updated_at=func.now())
         )
-    return dict(row) if row else None
+        await s.commit()
+
+
+async def mark_reminder_failed(rid: str, err: str):
+    async with Session() as s:
+        await s.execute(
+            update(Reminder)
+            .where(Reminder.reminder_id == rid)
+            .values(status="failed", last_error=err, updated_at=func.now())
+        )
+        await s.commit()
+
+
+# 4.5 Search helpers ---------------------------------------------------
+async def search_reminders(
+    user_id: str,
+    keyword: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = 10,
+) -> list[dict]:
+    async with Session() as s:
+        stmt = select(Reminder).where(Reminder.user_id == user_id)
+
+        if keyword:
+            stmt = stmt.where(Reminder.reminder_text.ilike(f"%{keyword}%"))
+        if start:
+            stmt = stmt.where(Reminder.created_at >= start)
+        if end:
+            stmt = stmt.where(Reminder.created_at <= end)
+
+        stmt = stmt.order_by(Reminder.created_at.desc()).limit(limit)
+
+        res = await s.execute(stmt)
+        return [r.__dict__ for r in res.scalars()]
+
+
+async def search_envelopes(
+    user_id: str,
+    keyword: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = 10,
+) -> list[dict]:
+    async with Session() as s:
+        stmt = select(MessageEnvelope).where(MessageEnvelope.user_id == user_id)
+
+        if keyword:
+            stmt = stmt.where(MessageEnvelope.instruction.ilike(f"%{keyword}%"))
+        if start:
+            stmt = stmt.where(MessageEnvelope.created_at >= start)
+        if end:
+            stmt = stmt.where(MessageEnvelope.created_at <= end)
+
+        stmt = stmt.order_by(MessageEnvelope.created_at.desc()).limit(limit)
+
+        res = await s.execute(stmt)
+        return [e.__dict__ for e in res.scalars()]
+
+
+# 4.6 Envelope clarification helpers -----------------------------------
+async def latest_awaiting_envelope(user_id: str) -> dict | None:
+    async with Session() as s:
+        stmt = (
+            select(MessageEnvelope)
+            .where(
+                MessageEnvelope.user_id == user_id,
+                MessageEnvelope.status == "awaiting_user",
+            )
+            .order_by(MessageEnvelope.created_at.desc())
+            .limit(1)
+        )
+        res = await s.execute(stmt)
+        env = res.scalar_one_or_none()
+        return env.__dict__ if env else None
+
 
 async def apply_clarification(envelope_id: str, new_instruction: str):
-    """Update instruction + reset status to 'received'. Return updated row."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE message_envelopes
-            SET instruction=$2, status='received'
-            WHERE envelope_id=$1
-            """,
-            envelope_id,
-            new_instruction,
+    async with Session() as s:
+        await s.execute(
+            update(MessageEnvelope)
+            .where(MessageEnvelope.envelope_id == envelope_id)
+            .values(instruction=new_instruction, status="received")
         )
-        row = await conn.fetchrow(
-            "SELECT * FROM message_envelopes WHERE envelope_id=$1", envelope_id
-        )
-    return dict(row)
+        await s.commit()
