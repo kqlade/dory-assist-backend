@@ -62,19 +62,67 @@ FUNCTION_DEF = {
     "parameters": {
         "type": "object",
         "properties": {
-            "intent": {"type": "string", "description": "User intent label"},
-            "confidence": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
+            "intent": {
+                "type": "string",
+                "description": "User intent label",
+                "enum": ["save", "reminder", "both", "unknown"],
             },
+            "confidence": {"type": "number"},
             "need_clarification": {"type": "boolean"},
             "clarification_question": {"type": "string"},
-            "entities": {"type": "array", "items": {"type": "object"}},
+            "entities": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string"},
+                        "name": {"type": "string"},
+                        "city": {"type": "string"},
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "needs_resolution": {"type": "boolean"},
+                    },
+                    "required": ["type", "name"],
+                },
+            },
         },
         "required": ["intent", "confidence"],
+        "additionalProperties": False,
     },
 }
+
+INTENT_SYNONYMS = {
+    "set_reminder": "reminder",
+    "add_reminder": "reminder",
+}
+
+
+def _normalize_llm_json(raw: str) -> str:
+    """Fix common schema drift issues before Pydantic validation."""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        # If already dict-like, just cast
+        if isinstance(raw, dict):
+            data = raw
+        else:
+            raise
+
+    # Map intent synonyms
+    intent = data.get("intent")
+    if intent in INTENT_SYNONYMS:
+        data["intent"] = INTENT_SYNONYMS[intent]
+
+    # Patch entity field names
+    if isinstance(data.get("entities"), list):
+        for ent in data["entities"]:
+            if "entity" in ent and "value" in ent:
+                ent["type"] = ent.pop("entity")
+                ent["name"] = ent.pop("value")
+
+    return json.dumps(data)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -158,10 +206,10 @@ async def run(envelope: Dict[str, Any], ocr_text: str | None = None) -> ParserRe
 
     try:
         raw_json = await _call_openai(messages)
-        return ParserReply.parse_raw(raw_json)
-    except Exception as exc:
-        _LOGGER.exception("Failed to parse LLM JSON: %s", exc)
-        raise ValueError(f"Failed to parse LLM JSON: {exc!s}\nRAW: {raw_json}") from exc
+        return ParserReply.parse_raw(_normalize_llm_json(raw_json))
+    except Exception as e:
+        # Attach raw json for debugging
+        raise ValueError(f"Failed to parse LLM JSON: {e}\nRAW: {raw_json}") from e
 
 
 # ──────────────────────────────────────────────────────────────────────────
