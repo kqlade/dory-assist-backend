@@ -1,0 +1,6 @@
+[phases.setup]
+aptPkgs = [
+  "exiftool",   # CLI binary pyexiftool wraps
+  "libheif1",   # HEIC/HEIF decoder used by pillow-heif
+  "libde265-0"  # HEVC bit-stream library (required by libheif)
+] 

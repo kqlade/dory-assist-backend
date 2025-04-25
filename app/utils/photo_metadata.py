@@ -1,93 +1,74 @@
 # app/utils/photo_metadata.py
 from __future__ import annotations
 
+import os
 import pathlib
 from io import BytesIO
 from typing import Any, Dict, Optional, Union
+from tempfile import NamedTemporaryFile
 
 import requests
 from PIL import Image, ExifTags
-from PIL.ExifTags import TAGS, GPSTAGS
 from exiftool import ExifToolHelper
-import os
-from tempfile import NamedTemporaryFile
 
-# ─────────────────────────── HEIC/HEIF support ─────────────────────────────
+# Optional HEIC/HEIF support
 try:
     import pillow_heif  # type: ignore
     pillow_heif.register_heif_opener()
 except ImportError:
-    # Library not installed → JPEG/PNG still work; silently ignore
     pass
 
+# ───────────────────────── helpers ──────────────────────────
+def _download(url: str) -> bytes:
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    return resp.content
 
-# ────────────────────────────── Helpers ────────────────────────────────────
-def _load_image(path_or_url: str) -> Image.Image:
-    """Open a Pillow Image from a local path **or** a remote URL."""
-    if path_or_url.startswith(("http://", "https://")):
-        resp = requests.get(path_or_url, timeout=10)
-        resp.raise_for_status()
-        return Image.open(BytesIO(resp.content))
-    return Image.open(pathlib.Path(path_or_url).expanduser())
-
-
-def _exif_dict(img: Image.Image) -> dict[int, Any]:
-    """Return raw EXIF tags as a plain dict, regardless of Pillow version."""
-    try:
-        return dict(img.getexif())  # Pillow ≥ 7
-    except AttributeError:
-        # Older Pillow
-        return dict(getattr(img, "_getexif", lambda: {})() or {})
-
-
-def _convert_gps(coord, ref: Optional[Union[str, bytes]]) -> Optional[float]:
-    """Convert EXIF GPS tuples into signed decimal degrees."""
-    if not coord or not ref:
+def _convert_gps_str(raw: str | None) -> Optional[float]:
+    """Parse '37 deg 46' 29.99" N' → 37.774999."""
+    if not raw:
         return None
+    import re
+    m = re.match(r"(\d+)\D+(\d+)\D+([\d.]+)\D+([NSEW])", raw)
+    if not m:
+        return None
+    deg, minute, sec, ref = m.groups()
+    dec = float(deg) + float(minute) / 60 + float(sec) / 3600
+    return -dec if ref in "SW" else dec
 
-    if isinstance(ref, bytes):
-        ref = ref.decode(errors="ignore")
-
-    def _val(rat) -> float:
-        try:
-            return rat.num / rat.den  # IFDRational
-        except AttributeError:
-            num, den = rat if isinstance(rat, tuple) else (rat, 1)
-            return num / den
-
-    deg, minute, sec = map(_val, coord)
-    dec = deg + minute / 60 + sec / 3600
-    return -dec if ref in {"S", "W"} else dec
-
-
-# ─────────────────────────── Public API ─────────────────────────────────────
+# ───────────────────────── public API ──────────────────────────
 def extract_photo_metadata(path_or_url: str) -> Dict[str, Optional[Union[str, float]]]:
     """
-    Extract EXIF metadata using ExifTool (robust for JPEG, HEIC, RAW, video, etc).
-    Returns a dict with keys: datetime_original, gps_latitude, gps_longitude, camera_make, camera_model.
+    Extract EXIF metadata via ExifTool.  Called inside `asyncio.to_thread()`
+    so the blocking I/O is safe within the async code-base.
     """
-    # Download if URL
-    if path_or_url.startswith(("http://", "https://")):
-        resp = requests.get(path_or_url, timeout=10)
-        resp.raise_for_status()
-        with NamedTemporaryFile(delete=False, suffix=Path(path_or_url).suffix) as tmp:
-            tmp.write(resp.content)
+    is_remote = path_or_url.startswith(("http://", "https://"))
+    tmp_path: str | os.PathLike
+
+    if is_remote:
+        data = _download(path_or_url)
+        suffix = pathlib.Path(path_or_url).suffix or ".img"
+        with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(data)
             tmp_path = tmp.name
     else:
         tmp_path = path_or_url
 
-    with ExifToolHelper() as et:
-        meta_list = et.get_metadata(str(tmp_path))
+    try:
+        with ExifToolHelper() as et:
+            meta_list = et.get_metadata(str(tmp_path))
         meta = meta_list[0] if meta_list else {}
+    finally:
+        if is_remote:
+            os.unlink(tmp_path)  # always clean up
 
-    # Clean up temp file if we downloaded
-    if path_or_url.startswith(("http://", "https://")):
-        os.unlink(tmp_path)
+    lat = _convert_gps_str(meta.get("EXIF:GPSLatitude"))
+    lon = _convert_gps_str(meta.get("EXIF:GPSLongitude"))
 
     return {
         "datetime_original": meta.get("EXIF:DateTimeOriginal"),
-        "gps_latitude": meta.get("EXIF:GPSLatitude"),
-        "gps_longitude": meta.get("EXIF:GPSLongitude"),
+        "gps_latitude": lat,
+        "gps_longitude": lon,
         "camera_make": meta.get("EXIF:Make"),
         "camera_model": meta.get("EXIF:Model"),
     }

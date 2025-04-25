@@ -1,16 +1,28 @@
-fastapi==0.100.0
-hypercorn==0.14.4
-requests
-telnyx
-uvicorn[standard]
-asyncpg
-openai
-tenacity
-pytest
-pytest-asyncio
-celery[redis]
-pyexiftool
-alembic
-SQLAlchemy>=2.0
-crawl4ai
-psycopg2-binary
+# ───── API stack ───────────────────────────────────────────────
+fastapi==0.109.0              # 0.109 = first release fully tested on Py3.12/3.13
+uvicorn[standard]==0.28.0     # includes watchfiles, h11, websockets
+hypercorn==0.16.0             # optional ASGI server for HTTP/3
+
+# ───── DB & migrations ─────────────────────────────────────────
+SQLAlchemy>=2.0.29,<2.1
+asyncpg>=0.29                 # async driver Railway & local
+alembic>=1.13
+
+# ───── Queue & background ──────────────────────────────────────
+celery[redis]>=5.3
+
+# ───── External APIs ───────────────────────────────────────────
+openai>=1.14
+telnyx>=2.17
+requests>=2.31
+tenacity>=8.2
+
+# ───── Image / EXIF handling ───────────────────────────────────
+Pillow>=10.2
+pillow-heif>=0.12             # HEIC/HEIF opener for Pillow
+pyexiftool==0.5.6             # Python wrapper – still needs exiftool binary
+
+# ───── Dev / tests ─────────────────────────────────────────────
+pytest>=8.0
+pytest-asyncio>=0.23
+crawl4ai                       # (you had this – left as-is)
