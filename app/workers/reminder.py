@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from app.celery_app import celery_app
 from app.utils.sms import send_sms
-import asyncio
 import db
+import asyncio
 
 
 # ---------------------------------------------------------------------------
@@ -17,7 +17,7 @@ def handle(self, reminder_id: str, user_id: str, reminder_text: str):  # noqa: D
     """Send a single reminder SMS and mark DB status accordingly."""
     try:
         send_sms(user_id, reminder_text)
-        # Mark sent in DB (async helper wrapped via asyncio)
+        # run in event loop to reuse connection pool
         asyncio.run(db.mark_reminder_sent(reminder_id))
     except Exception as exc:  # noqa: BLE001
         # Mark failure + retry with backoff
@@ -29,7 +29,7 @@ def handle(self, reminder_id: str, user_id: str, reminder_text: str):  # noqa: D
 def dispatch_due(self):  # noqa: D401
     """Fetch due reminders and enqueue handle tasks for each."""
     try:
-        due: list[dict] = asyncio.run(db.fetch_due_reminders(limit=100))
+        due: list[dict] = asyncio.run(db.claim_due_reminders(limit=100))
     except Exception as exc:  # noqa: BLE001
         self.retry(exc=exc, countdown=30)
         return

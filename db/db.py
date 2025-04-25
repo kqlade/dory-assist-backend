@@ -32,14 +32,17 @@ async def insert_envelope(envelope: dict):
                 channel,
                 instruction,
                 payload,
+                status,
                 created_at
-            ) VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+            ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+            ON CONFLICT (envelope_id) DO NOTHING
             """,
             envelope["envelope_id"],
             envelope["user_id"],
             envelope["channel"],
             envelope["instruction"],
             json.dumps(envelope["payload"]),
+            envelope.get("status", "received"),
             envelope["created_at"],
         )
 
@@ -171,7 +174,113 @@ async def create_message_envelopes_table():
                 instruction  TEXT NOT NULL,
                 payload      JSONB,
                 raw_refs     JSONB,
+                status       TEXT NOT NULL DEFAULT 'received',
                 created_at   TIMESTAMPTZ DEFAULT now()
             );
             """
         )
+
+async def search_reminders(user_id: str, keyword: str | None = None, start: datetime | None = None, end: datetime | None = None, limit: int = 10):
+    """Return recent reminders for a user matching optional keyword and date range."""
+    pool = await get_pool()
+    clauses = ["user_id = $1"]
+    params: list = [user_id]
+    idx = 2
+    if keyword:
+        clauses.append(f"reminder_text ILIKE ${idx}")
+        params.append(f"%{keyword}%")
+        idx += 1
+    if start:
+        clauses.append(f"created_at >= ${idx}")
+        params.append(start)
+        idx += 1
+    if end:
+        clauses.append(f"created_at <= ${idx}")
+        params.append(end)
+        idx += 1
+
+    where_sql = " AND ".join(clauses)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT reminder_id, reminder_text, created_at, status
+            FROM reminders
+            WHERE {where_sql}
+            ORDER BY created_at DESC
+            LIMIT {limit}
+            """,
+            *params,
+        )
+    return [dict(r) for r in rows]
+
+async def search_envelopes(user_id: str, keyword: str | None = None, start: datetime | None = None, end: datetime | None = None, limit: int = 10):
+    """Return recent message envelopes for a user."""
+    pool = await get_pool()
+    clauses = ["user_id = $1"]
+    params: list = [user_id]
+    idx = 2
+    if keyword:
+        clauses.append(f"instruction ILIKE ${idx}")
+        params.append(f"%{keyword}%")
+        idx += 1
+    if start:
+        clauses.append(f"created_at >= ${idx}")
+        params.append(start)
+        idx += 1
+    if end:
+        clauses.append(f"created_at <= ${idx}")
+        params.append(end)
+        idx += 1
+
+    where_sql = " AND ".join(clauses)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT envelope_id, instruction, created_at, payload
+            FROM message_envelopes
+            WHERE {where_sql}
+            ORDER BY created_at DESC
+            LIMIT {limit}
+            """,
+            *params,
+        )
+    return [dict(r) for r in rows]
+
+# ──────────────────────────────────────────────
+# New helpers
+# ──────────────────────────────────────────────
+
+async def update_envelope_status(envelope_id: str, status: str):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE message_envelopes
+            SET status=$2, created_at=created_at -- touch nothing else
+            WHERE envelope_id=$1
+            """,
+            envelope_id,
+            status,
+        )
+
+async def claim_due_reminders(limit: int = 100):
+    """Atomically set status='processing' and return claimed rows."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            WITH due AS (
+                SELECT reminder_id FROM reminders
+                WHERE status='pending' AND reminder_time <= NOW()
+                ORDER BY reminder_time ASC
+                LIMIT $1
+            )
+            UPDATE reminders r SET status='processing', updated_at=NOW()
+            FROM due WHERE r.reminder_id = due.reminder_id
+            RETURNING r.*
+            """,
+            limit,
+        )
+    return [dict(r) for r in rows]

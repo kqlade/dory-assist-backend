@@ -88,6 +88,56 @@ FUNCTION_DEF = {
 
 INTENT_SYNONYMS: dict[str, str] = {}
 
+FUNCTIONS = [
+    {"type": "function", "function": FUNCTION_DEF},
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_reminders",
+            "description": "Search past reminders for the user.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string"},
+                    "keyword": {"type": "string"},
+                    "limit": {"type": "integer", "default": 5},
+                },
+                "required": ["user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_envelopes",
+            "description": "Search past message envelopes for the user.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string"},
+                    "keyword": {"type": "string"},
+                    "limit": {"type": "integer", "default": 5},
+                },
+                "required": ["user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url_content",
+            "description": "Download a URL and return cleaned markdown for the LLM.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "max_chars": {"type": "integer", "default": 10000},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+]
 
 def _normalize_llm_json(raw: str) -> str:
     """Fix common schema drift issues before Pydantic validation."""
@@ -179,6 +229,54 @@ async def _call_openai(messages: List[ChatCompletionMessageParam]) -> str:
         raise ValueError("LLM did not invoke the parse_sms tool and fallback JSON parse failed")
 
 
+async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam]) -> str:
+    """Loop calling OpenAI, executing tools until we get parse_reminder."""
+    max_iters = 3
+    for _ in range(max_iters):
+        response = await client.chat.completions.create(
+            model=_MODEL,
+            messages=messages,
+            tools=FUNCTIONS,
+            tool_choice="auto",
+            timeout=_TIMEOUT,
+        )
+        msg = response.choices[0].message
+        if msg.tool_calls:
+            call = msg.tool_calls[0]
+            name = call.function.name
+            args = json.loads(call.function.arguments)
+            # Execute tool
+            if name == "lookup_reminders":
+                from db import search_reminders  # local import to avoid cycles
+                results = await search_reminders(
+                    user_id=args["user_id"],
+                    keyword=args.get("keyword"),
+                    limit=args.get("limit", 5),
+                )
+                payload = json.dumps(results)
+            elif name == "lookup_envelopes":
+                from db import search_envelopes
+                results = await search_envelopes(
+                    user_id=args["user_id"],
+                    keyword=args.get("keyword"),
+                    limit=args.get("limit", 5),
+                )
+                payload = json.dumps(results)
+            elif name == "parse_reminder":
+                return call.function.arguments  # already JSON str
+            elif name == "fetch_url_content":
+                from app.utils.web_fetch import fetch_url_content
+                payload = await fetch_url_content(args["url"], args.get("max_chars", 10000))
+            else:
+                payload = "{}"
+            # Append tool response and loop
+            messages.append({"role": "tool", "tool_call_id": call.id, "name": name, "content": payload})
+        else:
+            # No tool call; assume assistant responded with final JSON
+            return msg.content or ""
+    raise ValueError("Exceeded max tool iterations without parse_reminder")
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Public entry-point
 # ──────────────────────────────────────────────────────────────────────────
@@ -211,7 +309,7 @@ async def run(envelope: Dict[str, Any], ocr_text: str | None = None) -> Reminder
 
     raw_json = ""
     try:
-        raw_json = await _call_openai(messages)
+        raw_json = await _run_openai_with_tools(messages)
         return ReminderReply.model_validate_json(_normalize_llm_json(raw_json))
     except Exception as e:
         # Attach raw json for debugging, if any

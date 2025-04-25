@@ -23,8 +23,7 @@ app = FastAPI()
 @app.on_event("startup")
 async def startup_event():
     await db.get_pool()
-    await db.create_message_envelopes_table()
-    await db.create_reminders_table()
+    # Tables now managed via Alembic migrations
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -111,8 +110,12 @@ async def telnyx_webhook(request: Request):
     # Store envelope in Postgres
     try:
         await db.insert_envelope(envelope)
-        # Fire-and-forget background processing
-        asyncio.create_task(process_envelope_background(envelope))
+        # Dispatch parsing to Celery worker instead of in-process coroutine
+        celery_app.send_task(
+            "app.workers.parser.handle_envelope",
+            args=[envelope],
+            queue="parse",
+        )
     except Exception as e:
         # Log error but don't crash webhook
         print("DB insert failed:", e)

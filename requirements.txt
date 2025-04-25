@@ -10,3 +10,7 @@ pytest
 pytest-asyncio
 celery[redis]
 pyexiftool
+alembic
+SQLAlchemy>=2.0
+crawl4ai
+psycopg2-binary
