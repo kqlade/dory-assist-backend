@@ -237,7 +237,7 @@ async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam]) -> 
             model=_MODEL,
             messages=messages,
             tools=FUNCTIONS,
-            tool_choice="auto",
+            tool_choice={"type": "function", "function": "parse_reminder"},
             timeout=_TIMEOUT,
         )
         msg = response.choices[0].message
