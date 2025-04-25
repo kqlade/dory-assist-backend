@@ -13,7 +13,7 @@ celery[redis]>=5.3
 
 # ───── External APIs ───────────────────────────────────────────
 openai>=1.14
-telnyx>=2.17
+telnyx
 requests>=2.31
 tenacity>=8.2
 
