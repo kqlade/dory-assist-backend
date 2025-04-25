@@ -24,6 +24,11 @@ async def insert_envelope(envelope: dict):
     """Insert an envelope row into message_envelopes table."""
     pool = await get_pool()
     async with pool.acquire() as conn:
+        created_at = envelope["created_at"]
+        if created_at.tzinfo is None:
+            raise ValueError("created_at datetime must be timezone-aware (UTC)")
+        # Normalize to UTC to avoid mix-type errors
+        created_at = created_at.astimezone(timezone.utc)
         await conn.execute(
             """
             INSERT INTO message_envelopes (
@@ -43,7 +48,7 @@ async def insert_envelope(envelope: dict):
             envelope["instruction"],
             json.dumps(envelope["payload"]),
             envelope.get("status", "received"),
-            envelope["created_at"],
+            created_at,
         )
 
 # ──────────────────────────────────────────────
