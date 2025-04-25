@@ -53,7 +53,7 @@ async def telnyx_webhook(request: Request):
 
     if not from_num:
         # Not an inbound message we care about (e.g., DLR). Acknowledge and exit.
-        return "IGNORED", status.HTTP_200_OK
+        return PlainTextResponse("IGNORED", status_code=status.HTTP_200_OK)
 
     # 2.1 Capture Telnyx media URLs directly (no re-hosting)
     images = [{"external_url": m["url"]} for m in payload.get("media", [])]
@@ -77,4 +77,4 @@ async def telnyx_webhook(request: Request):
         print("Envelope:", envelope)
         raise HTTPException(status_code=500, detail="DB error")
 
-    return "OK", status.HTTP_200_OK
+    return PlainTextResponse("OK", status_code=status.HTTP_200_OK)
