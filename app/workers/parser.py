@@ -21,12 +21,18 @@ import db
 
 
 @celery_app.task(name="app.workers.parser.handle_envelope", bind=True, max_retries=3)
-async def handle_envelope(self, envelope: Dict):  # noqa: D401, ANN401
-    """Parse envelope and fan-out to downstream queues/storage."""
+def handle_envelope(self, envelope: Dict):  # noqa: D401, ANN401
+    """Parse envelope and fan-out to downstream queues/storage.
+
+    This task is defined as a *synchronous* function so that it runs correctly
+    with Celery's default prefork pool.  We run any async code using
+    ``asyncio.run`` to avoid returning coroutine objects (which cannot be
+    JSON-serialised by Kombu).
+    """
 
     try:
         # parser_agent.run is async – execute synchronously inside the worker
-        reply = await parser_agent.run(envelope, ocr_text=None)
+        reply = asyncio.run(parser_agent.run(envelope, ocr_text=None))
     except Exception as exc:  # noqa: BLE001
         # Retry with back-off so transient LLM errors don't lose the job
         raise self.retry(exc=exc, countdown=30)
@@ -37,22 +43,22 @@ async def handle_envelope(self, envelope: Dict):  # noqa: D401, ANN401
         question = reply.clarification_question or "Could you clarify your request?"
         send_sms(user_id, question)
         # Mark status so webhook can re-process reply later
-        await db.update_envelope_status(envelope["envelope_id"], "awaiting_user")
+        asyncio.run(db.update_envelope_status(envelope["envelope_id"], "awaiting_user"))
         return
 
     if not reply.reminder:
         # No useful output
         print("[ParserWorker] No reminder produced for envelope", envelope.get("envelope_id"))
-        await db.update_envelope_status(envelope["envelope_id"], "no_reminder")
+        asyncio.run(db.update_envelope_status(envelope["envelope_id"], "no_reminder"))
         return
 
     # Store reminder and send confirmation
     try:
-        await db.insert_reminder(reply.reminder)
+        asyncio.run(db.insert_reminder(reply.reminder))
     except Exception as exc:  # noqa: BLE001
         raise self.retry(exc=exc, countdown=30)
 
     # Confirmation to user (can be toggled via env var in future)
     send_sms(user_id, f"Got it! I'll remind you: {reply.reminder.reminder_text}")
     # Update envelope status to parsed
-    await db.update_envelope_status(envelope["envelope_id"], "parsed")
+    asyncio.run(db.update_envelope_status(envelope["envelope_id"], "parsed"))
