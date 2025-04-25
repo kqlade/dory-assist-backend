@@ -22,13 +22,12 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def startup_event():
-    await db.get_pool()
+    pass  # DB connections are now managed lazily
     # Tables now managed via Alembic migrations
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    pool = await db.get_pool()
-    await pool.close()
+    pass  # No explicit pool to close
 
 # --------------------------------------------
 # Background task: parse envelope and enqueue
