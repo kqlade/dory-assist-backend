@@ -32,4 +32,5 @@ celery_app.conf.beat_schedule = {
 # --- Ensure tasks are registered ---
 import app.workers.entity_resolver
 import app.workers.reminder
+import app.workers.parser
 
