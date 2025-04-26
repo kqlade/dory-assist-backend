@@ -91,6 +91,7 @@ class MessageEnvelope(Base):
     instruction: Mapped[str]
     payload:     Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status:      Mapped[str]   = mapped_column(default="received")
+    timezone:    Mapped[str | None]            = mapped_column(default=None)
     created_at:  Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -115,6 +116,7 @@ async def insert_envelope(envelope: dict):
         instruction=envelope["instruction"],
         payload=envelope.get("payload"),
         status=envelope.get("status", "received"),
+        timezone=envelope.get("timezone"),
         created_at=envelope.get("created_at", datetime.now(timezone.utc)),
     )
     async for s in get_session():
