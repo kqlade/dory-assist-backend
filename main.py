@@ -72,6 +72,7 @@ async def telnyx_webhook(request: Request, background: BackgroundTasks):
     sig = request.headers.get("telnyx-signature-ed25519")
     ts  = request.headers.get("telnyx-timestamp")
 
+    print("[Webhook] Raw incoming payload:", raw_body)
     try:
         if TELNYX_PUBLIC_KEY:
             event = telnyx.Webhook.construct_event(
@@ -121,8 +122,11 @@ async def telnyx_webhook(request: Request, background: BackgroundTasks):
         "created_at": created_at,
         "timezone": tz_str,
     }
+    print("[Webhook] Constructed envelope:", envelope)
     try:
+        print("[Webhook] Inserting envelope into DB...")
         await db.insert_envelope(envelope)
+        print("[Webhook] Added background task for parser_agent.run_and_store")
         background.add_task(parser_agent.run_and_store, envelope)
     except Exception as e:
         print("DB insert failed:", e)

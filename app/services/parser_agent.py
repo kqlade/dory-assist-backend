@@ -293,6 +293,8 @@ def _get(env: Dict[str, Any], key: str, default: Any = None) -> Any:  # noqa: AN
 def _build_messages(env: Dict[str, Any]) -> List[ChatCompletionMessageParam]:
     """Compose a multimodal message list for Chat Completions."""
 
+    print("[ParserAgent] Building LLM prompt/messages from envelope:", env)
+
     tmstp = _get(env, "created_at")
     if isinstance(tmstp, (dt.datetime,)):
         tmstp = tmstp.isoformat()
@@ -322,10 +324,12 @@ def _build_messages(env: Dict[str, Any]) -> List[ChatCompletionMessageParam]:
         if url:
             user_payload.append({"type": "image_url", "image_url": {"url": url}})
 
-    return [
+    messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": user_payload},
     ]
+    print("[ParserAgent] LLM message list:", messages)
+    return messages
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -462,7 +466,7 @@ async def run(envelope: Dict[str, Any]) -> ReminderReply:  # noqa: C901, PLR0912
     try:
         msgs = _build_messages(envelope)
         raw_json = await _run_openai_with_tools(msgs)
-        print(f"LLM raw JSON output: {raw_json}")
+        print(f"[ParserAgent] LLM raw JSON output: {raw_json}")
         _LOGGER.info(f"LLM raw JSON output: {raw_json}")
 
         try:
@@ -480,12 +484,15 @@ async def run(envelope: Dict[str, Any]) -> ReminderReply:  # noqa: C901, PLR0912
         if parsed_data.get("need_clarification"):
             clar = parsed_data.get("clarification_question", "<none>")
             _LOGGER.info("LLM clarification: %s", clar)
-            print(f"LLM clarification: {clar}")
+            print(f"[ParserAgent] LLM clarification: {clar}")
 
         try:
-            return ReminderReply.model_validate_json(normalised_json)
+            reply_obj = ReminderReply.model_validate_json(normalised_json)
+            print("[ParserAgent] Parsed ReminderReply:", reply_obj)
+            return reply_obj
         except Exception as e:
             _LOGGER.error("Failed to validate ReminderReply: %s", normalised_json)
+            print("[ParserAgent] Failed to validate ReminderReply:", normalised_json)
             raise ParseFailure(
                 "Unable to validate LLM output against ReminderReply schema"
             ) from e
@@ -493,6 +500,7 @@ async def run(envelope: Dict[str, Any]) -> ReminderReply:  # noqa: C901, PLR0912
         raise
     except Exception as exc:  # noqa: BLE001
         _LOGGER.warning("Failed to parse assistant output: %s", exc)
+        print("[ParserAgent] Exception during parsing:", exc)
         raise ParseFailure("Unable to interpret LLM output") from exc
 
 
