@@ -448,7 +448,8 @@ class ParseFailure(Exception):
 
 async def run(envelope: Dict[str, Any]) -> ReminderReply:  # noqa: C901, PLR0912
     """Parse an MMS/SMS envelope into a structured `ReminderReply`.\n\n    Allows callers to pass either a flat or wrapped envelope.\n    """
-    envelope = envelope.get("payload", envelope)
+    # Do NOT replace the entire envelope with its internal 'payload'.
+    # _get() can already access nested keys when needed.
 
     if not OPENAI_API_KEY or not os.getenv("OPENAI_API_KEY", "").strip():
         # Local dev shortcut
