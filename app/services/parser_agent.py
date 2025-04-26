@@ -19,7 +19,12 @@ import datetime as dt
 import openai
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
-
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_random_exponential,
+    retry_if_exception_type,
+)
 
 from app.types.parser_contract import ReminderReply, ReminderTask, TimeTrigger
 import db as db_io
@@ -350,8 +355,14 @@ RETRY_ERRORS = (
     openai.InternalServerError,  # Added for 5xx
 )
 
-
-
+@retry(
+    wait=wait_random_exponential(multiplier=1, max=30),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type(RETRY_ERRORS),
+)
+async def _safe_completion(client, **kwargs):
+    """Execute an OpenAI completion with automatic retries for transient errors."""
+    return await client.chat.completions.create(**kwargs)
 
 # Import tool functions at top to avoid dynamic import overhead
 from app.utils.web_fetch import fetch_url_content
@@ -372,7 +383,8 @@ async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam], ope
     if MODEL_SUPPORTS_TEMP:
         kwargs["temperature"] = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))
     for _ in range(MAX_TOOL_ITERS):
-        response = await client.chat.completions.create(
+        response = await _safe_completion(
+            client,
             model=OPENAI_MODEL,
             messages=messages,
             tools=FUNCTIONS,
