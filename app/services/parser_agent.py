@@ -182,7 +182,7 @@ class Envelope(TypedDict, total=False):
     payload: Dict[str, Any]
 
 
-def _build_messages(env: Dict[str, Any], ocr_text: str | None = None) -> List[ChatCompletionMessageParam]:
+def _build_messages(env: Dict[str, Any]) -> List[ChatCompletionMessageParam]:
     """Compose a multimodal message list for Chat Completions."""
     pruned_env = {
         "from": env.get("user_id"),
@@ -221,7 +221,6 @@ RETRY_ERRORS = (
 )
 async def _call_openai(messages: List[ChatCompletionMessageParam]) -> str:
     """Call OpenAI with the parse_reminder tool and return JSON string."""
-    _LOGGER.debug("Calling OpenAI with parse_reminder tool")
     rsp = await _client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
@@ -233,14 +232,10 @@ async def _call_openai(messages: List[ChatCompletionMessageParam]) -> str:
     
     # Get JSON either from tool arguments or message content
     if msg.tool_calls:
-        result = msg.tool_calls[0].function.arguments
-        _LOGGER.debug(f"Tool call result: {result[:100]}...")
-        return result
+        return msg.tool_calls[0].function.arguments
     
     # Fallback to content if no tool call (shouldn't happen with tool_choice specified)
-    result = msg.content or ""
-    _LOGGER.debug(f"Content result (no tool call): {result[:100]}...")
-    return result
+    return msg.content or ""
 
 
 async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam]) -> str:
@@ -319,52 +314,14 @@ async def run(envelope: Dict[str, Any]) -> ReminderReply:
         msgs = _build_messages(envelope)
         raw_json = await _call_openai(msgs)
         
-        # Dump raw LLM output for debugging
-        _LOGGER.debug(f"Raw LLM output: {raw_json[:500]}")
-        
         # Validate by parsing then re-serializing to ensure proper JSON
         parsed_data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
-        _LOGGER.debug(f"Parsed data: {json.dumps(parsed_data, indent=2)}")
-        
-        # Add more defensive validation before Pydantic validation
-        if isinstance(parsed_data, dict):
-            # Handle missing triggers or empty triggers array
-            if "reminder" in parsed_data and isinstance(parsed_data["reminder"], dict):
-                reminder = parsed_data["reminder"]
-                
-                # Check if triggers is missing completely
-                if "triggers" not in reminder:
-                    _LOGGER.error(f"LLM returned reminder without triggers field: {json.dumps(reminder)}")
-                    # Force it to need clarification instead
-                    parsed_data["need_clarification"] = True
-                    parsed_data["clarification_question"] = "When should I remind you about this?"
-                    parsed_data.pop("reminder", None)  # Remove invalid reminder
-                
-                # Check if triggers array is empty
-                elif not reminder.get("triggers"):
-                    _LOGGER.error(f"LLM returned reminder with empty triggers array: {json.dumps(reminder)}")
-                    # Force it to need clarification instead
-                    parsed_data["need_clarification"] = True
-                    parsed_data["clarification_question"] = "When should I remind you about this?"
-                    parsed_data.pop("reminder", None)  # Remove invalid reminder
-                
-                # Check if triggers array contains objects without 'type' field
-                elif isinstance(reminder["triggers"], list) and any(
-                    not isinstance(t, dict) or "type" not in t 
-                    for t in reminder["triggers"]
-                ):
-                    _LOGGER.error(f"LLM returned invalid trigger objects: {json.dumps(reminder['triggers'])}")
-                    # Force it to need clarification instead
-                    parsed_data["need_clarification"] = True
-                    parsed_data["clarification_question"] = "I couldn't understand when to remind you. Please specify a time or date."
-                    parsed_data.pop("reminder", None)  # Remove invalid reminder
-        
         normalized_json = json.dumps(parsed_data, ensure_ascii=False)
         
         return ReminderReply.model_validate_json(normalized_json)
     except Exception as exc:
-        _LOGGER.warning(f"Failed to parse assistant output: {exc}, raw: {raw_json[:200]}")
-        raise ValueError(f"Unable to interpret LLM output: {exc}") from exc
+        _LOGGER.warning("Failed to parse assistant output: %s", exc)
+        raise ValueError("Unable to interpret LLM output") from exc
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -374,15 +331,13 @@ if __name__ == "__main__":
     import asyncio, sys, pprint, json as _json
 
     dummy_env = {
-        "user_id": "example_user",
-        "instruction": "Remind me to buy 2 tickets for Friday at 7 pm",
         "payload": {
             "images": [
                 {"url": "https://example.com/foo.jpg"},
             ]
         }
     }
-    
+
     pprint.pp(asyncio.run(run(dummy_env)))
 
 # ─────────────────────────── background helper ─────────────────────── #
@@ -392,33 +347,9 @@ async def run_and_store(envelope: Dict[str, Any]):
     Run the parser and store the reminder if found.
     """
     try:
-        _LOGGER.info(f"Processing envelope: {envelope.get('envelope_id')} from user {envelope.get('user_id')}")
         reply = await run(envelope)
-        
-        if reply.need_clarification:
-            _LOGGER.info(f"Clarification needed: {reply.clarification_question}")
-            # Could send SMS here requesting clarification
-            return
-            
-        if not reply.reminder:
-            _LOGGER.warning("No reminder in reply and no clarification requested")
-            return
-            
-        # Extra validation for the triggers
-        if not reply.reminder.triggers:
-            _LOGGER.error("Empty triggers list in reminder (should have been caught earlier)")
-            return
-            
-        # Log what kind of trigger we're using
-        trigger_types = [t.type for t in reply.reminder.triggers]
-        _LOGGER.info(f"Storing reminder with trigger types: {trigger_types}")
-        
-        # Store reminder
-        await db.insert_reminder(reply.reminder)
-        _LOGGER.info(f"Successfully stored reminder for user {reply.reminder.user_id}")
+        if not reply.need_clarification and reply.reminder:
+            await db.insert_reminder(reply.reminder)
+        # else: could send clarification SMS here if needed
     except Exception as exc:
         _LOGGER.error(f"run_and_store failed: {exc}")
-        # For detailed debugging:
-        if envelope and isinstance(envelope, dict):
-            _LOGGER.error(f"Envelope that caused error: id={envelope.get('envelope_id')}, user={envelope.get('user_id')}")
-            _LOGGER.error(f"Instruction: {envelope.get('instruction', '')[:100]}")

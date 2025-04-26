@@ -32,7 +32,7 @@ def handle_envelope(self, envelope: Dict):  # noqa: D401, ANN401
 
     try:
         # parser_agent.run is async – execute synchronously inside the worker
-        reply = asyncio.run(parser_agent.run(envelope, ocr_text=None))
+        reply = asyncio.run(parser_agent.run(envelope))
     except Exception as exc:  # noqa: BLE001
         # Retry with back-off so transient LLM errors don't lose the job
         raise self.retry(exc=exc, countdown=30)

@@ -37,6 +37,6 @@ async def test_parser_agent_stub(monkeypatch):
         "created_at": "2025-01-01T00:00:00Z",
     }
 
-    reply = await parser_agent.run(envelope, ocr_text=None)
+    reply = await parser_agent.run(envelope)
     assert not reply.need_clarification
     assert isinstance(reply.reminder, ReminderTask)
