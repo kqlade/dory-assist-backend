@@ -71,9 +71,9 @@ _SYSTEM_PROMPT: Final = textwrap.dedent(
     • You may call at most **3** tool iterations. Be efficient.
 
     ### Time interpretation rules
-    1. Convert relative times (e.g. “in 2 hours”) to absolute UTC ISO-8601 by adding the offset to `Envelope.timestamp`.
+    1. Convert relative times (e.g. "in 2 hours") to absolute UTC ISO-8601 by adding the offset to `Envelope.timestamp`.
     2. If the user gives only a clock time:
-       • If that time is still in the future **today** in the envelope’s timezone → assume today.
+       • If that time is still in the future **today** in the envelope's timezone → assume today.
        • Otherwise → assume tomorrow.
     3. Ask a clarification question **only** when genuinely ambiguous. Do **NOT** invent dates or times.
 
@@ -226,6 +226,10 @@ def _get(env: Dict[str, Any], key: str, default: Any = None) -> Any:  # noqa: AN
 def _build_messages(env: Dict[str, Any]) -> List[ChatCompletionMessageParam]:
     """Compose a multimodal message list for Chat Completions."""
 
+    tmstp = _get(env, "created_at")
+    if isinstance(tmstp, (dt.datetime,)):
+        tmstp = tmstp.isoformat()
+
     pruned_env = {
         "from": _get(env, "user_id"),
         "body": (_get(env, "body") or _get(env, "instruction") or "")[:280],
@@ -233,7 +237,7 @@ def _build_messages(env: Dict[str, Any]) -> List[ChatCompletionMessageParam]:
             img.get("url") or img.get("external_url")
             for img in _get(env, "images", [])
         ],
-        "timestamp": _get(env, "timestamp"),
+        "timestamp": tmstp,
     }
 
     user_payload: List[Dict[str, Any]] = [
