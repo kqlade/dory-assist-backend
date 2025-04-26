@@ -73,7 +73,7 @@ class Reminder(Base):
     reminder_text:Mapped[str]
     channel:      Mapped[str]  = mapped_column(default="sms")
     status:       Mapped[str]  = mapped_column(default="pending")
-    next_fire_at: Mapped[datetime | None]
+    next_fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error:   Mapped[str | None]
     payload:      Mapped[dict[str, Any]] = mapped_column(JSON)
     created_at:   Mapped[datetime] = mapped_column(server_default=func.now())
