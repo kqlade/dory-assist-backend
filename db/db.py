@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import json
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Sequence, TypedDict, Any, AsyncGenerator
 from uuid import uuid4
 
@@ -109,6 +109,11 @@ async def create_all():
 
 # 5.1 Insert envelope --------------------------------------------------
 async def insert_envelope(envelope: dict):
+    created_at = envelope.get("created_at", datetime.now(timezone.utc))
+    # Validate timezone awareness
+    if created_at.tzinfo is None or created_at.tzinfo.utcoffset(created_at) is None:
+        raise ValueError("created_at must be timezone-aware")
+
     env = MessageEnvelope(
         envelope_id=envelope["envelope_id"],
         user_id=envelope.get("user_id"),
@@ -117,7 +122,7 @@ async def insert_envelope(envelope: dict):
         payload=envelope.get("payload"),
         status=envelope.get("status", "received"),
         timezone=envelope.get("timezone"),
-        created_at=envelope.get("created_at", datetime.now(timezone.utc)),
+        created_at=created_at,
     )
     async for s in get_session():
         s.add(env)

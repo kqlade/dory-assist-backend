@@ -35,6 +35,7 @@ async def test_parser_agent_stub(monkeypatch):
         "instruction": "Save this",
         "payload": {"images": []},
         "created_at": "2025-01-01T00:00:00Z",
+        "timezone": "America/Los_Angeles",
     }
 
     reply = await parser_agent.run(envelope)

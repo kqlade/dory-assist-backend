@@ -109,13 +109,17 @@ async def telnyx_webhook(request: Request, background: BackgroundTasks):
         return PlainTextResponse("CLARIFICATION_RECEIVED", status_code=200)
 
     UTC = datetime.timezone.utc
+    # Derive logical timezone string; fallback to 'UTC'.
+    created_at = datetime.datetime.now(tz=UTC)
+    tz_str = created_at.tzname() or "UTC"
     envelope = {
         "envelope_id": str(uuid.uuid4()),
         "user_id": from_num,
         "channel": "sms",
         "instruction": text.strip(),
         "payload": {"images": images},
-        "created_at": datetime.datetime.now(tz=UTC),
+        "created_at": created_at,
+        "timezone": tz_str,
     }
     try:
         await db.insert_envelope(envelope)

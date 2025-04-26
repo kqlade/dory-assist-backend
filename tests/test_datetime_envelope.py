@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import pytest
 import asyncio
 from db.db import insert_envelope
@@ -12,6 +12,7 @@ async def test_insert_naive_datetime_raises():
         "instruction": "test",
         "payload": {},
         "created_at": datetime(2025, 4, 25, 15, 0, 0),  # Naive!
+        "timezone": "UTC",
     }
     with pytest.raises(ValueError, match="timezone-aware"):
         await insert_envelope(envelope)
@@ -24,7 +25,8 @@ async def test_insert_aware_datetime_succeeds():
         "channel": "sms",
         "instruction": "test",
         "payload": {},
-        "created_at": datetime(2025, 4, 25, 15, 0, 0, tzinfo=datetime.timezone.utc),
+        "created_at": datetime(2025, 4, 25, 15, 0, 0, tzinfo=timezone.utc),
+        "timezone": "UTC",
     }
     # Should not raise
     await insert_envelope(envelope)

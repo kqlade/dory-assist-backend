@@ -305,7 +305,7 @@ def _build_messages(env: Dict[str, Any]) -> List[ChatCompletionMessageParam]:
             for img in _get(env, "images", [])
         ],
         "timestamp": tmstp,
-        "timezone": _get(env, "timezone"),
+        "timezone": _get(env, "timezone") or "America/Los_Angeles",
     }
 
     user_payload: List[Dict[str, Any]] = [
@@ -446,15 +446,16 @@ async def run(envelope: Dict[str, Any]) -> ReminderReply:  # noqa: C901, PLR0912
     """Parse an MMS/SMS envelope into a structured `ReminderReply`.\n\n    Allows callers to pass either a flat or wrapped envelope.\n    """
     envelope = envelope.get("payload", envelope)
 
-    if not OPENAI_API_KEY:
+    if not OPENAI_API_KEY or not os.getenv("OPENAI_API_KEY", "").strip():
         # Local dev shortcut
         dt_obj = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+        tz = envelope.get("timezone") or "America/Los_Angeles"
         return ReminderReply(
             need_clarification=False,
             reminder=ReminderTask(
                 user_id=envelope.get("user_id", "unknown"),
                 reminder_text=envelope.get("body", envelope.get("instruction", "todo")),
-                triggers=[TimeTrigger(at=dt_obj, timezone="UTC")],
+                triggers=[TimeTrigger(at=dt_obj, timezone=tz)],
             ),
         )
 
