@@ -4,6 +4,7 @@ LLM-powered Parser/Planner agent.
 Converts an SMS/MMS *Envelope* into a `ReminderReply`.
 
 Author: <you>
+Synopsis: from app.services.parser_agent import run
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import json
 import logging
 import os
 from typing import Any, Dict, List, TypedDict
-from datetime import datetime, timedelta, timezone
+import datetime as dt
 
 import openai
 from openai import AsyncOpenAI
@@ -26,19 +27,34 @@ from tenacity import (
 )
 
 from app.types.parser_contract import ReminderReply, ReminderTask, TimeTrigger
-import db
+import db as db_io
 
 # ──────────────────────────────────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────────────────────────────────
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# Use a model that officially supports function/tool calling. Allow override via env.
-# As of 2024, o4-mini supports tool/function calling (see OpenAI/third-party docs).
-OPENAI_MODEL          = os.getenv("OPENAI_MODEL", "o4-mini")
-OPENAI_TIMEOUT        = float(os.getenv("OPENAI_TIMEOUT", "30"))
+from typing import Final
 
-_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+try:
+    OPENAI_API_KEY: Final = os.environ["OPENAI_API_KEY"].strip()
+    OPENAI_MODEL: Final = os.environ["OPENAI_MODEL"].strip()
+    OPENAI_TIMEOUT: Final = float(os.getenv("OPENAI_TIMEOUT", "30"))
+except KeyError as e:
+    raise RuntimeError(f"Missing env var: {e}") from None
+except ValueError as e:
+    raise RuntimeError(f"Invalid config value: {e}") from None
+
+MODEL_SUPPORTS_TEMP: Final = not OPENAI_MODEL.startswith(("o3", "o4"))
+
+if not MODEL_SUPPORTS_TEMP and "OPENAI_TEMPERATURE" in os.environ:
+    raise RuntimeError(
+        f"{OPENAI_MODEL} ignores temperature/top_p; "
+        "remove OPENAI_TEMPERATURE from the environment."
+    )
+
+_client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT)
+
+__all__ = ["run", "run_and_store"]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,35 +62,116 @@ _LOGGER = logging.getLogger(__name__)
 # Prompts & function-tool definition
 # ──────────────────────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = (
+# TODO: Move prompts to prompts/ directory and load at import time.
+_SYSTEM_PROMPT: Final = (
     "You are an intake assistant that extracts **time-based reminders** from "
-    "user SMS/MMS (text, images and links). "
-    "Return ONLY JSON that matches the given schema. "
-    "If you can fully determine the reminder, create the `reminder` object. "
-    "**Crucially:** Every `reminder` *must* include a `triggers` array with at least one valid trigger. "
-    "If you cannot determine a specific trigger (or any required field), you *must* set "
-    "`need_clarification=true` and provide exactly one `clarification_question` asking for the missing info. "
-    "Do NOT return a `reminder` object if clarification is required."
-    "\n\n"
-    "Always include the top-level key `need_clarification`. "
-    "\n\n"
+    "user SMS/MMS (text, images and links).  You have access to the message's "
+    "`timestamp` field, which is the ISO-8601 UTC time when the message arrived.  "
+    "Whenever the user expresses a relative time (e.g. 'in 5 minutes', 'in 2 hours', 'in 3 days'), convert it into an absolute UTC ISO-8601 timestamp by adding "
+    "that offset to the envelope's `timestamp`.  \n\n"
+    "Return **only** JSON that matches the given schema.  If you can fully determine "
+    "the reminder, create the `reminder` object with a non-empty `triggers` array.  "
+    "If you cannot determine a specific trigger (or any required field), set "
+    "`need_clarification=true` and provide exactly one `clarification_question`.  "
+    "Do **not** invent dates or times if none are given; ask instead.  \n\n"
+    "# Example – relative time\n"
+    "Envelope.timestamp: \"2025-04-26T00:00:00Z\"\n"
+    "User says: Remind me in 5 minutes to stretch\n"
+    "Assistant JSON:\n"
+    "{\n"
+    "  \"need_clarification\": false,\n"
+    "  \"reminder\": {\n"
+    "    \"user_id\": \"5551234\",\n"
+    "    \"reminder_text\": \"stretch\",\n"
+    "    \"triggers\": [\n"
+    "      {\"type\": \"time\", \"at\": \"2025-04-26T00:05:00Z\", \"timezone\": \"UTC\"}\n"
+    "    ],\n"
+    "    \"channel\": \"sms\"\n"
+    "  }\n"
+    "}\n\n"
     "# Example – clarification needed\n"
-    "User says: Remind me to pay rent\n"
+    "User says: Remind me to call John\n"
     "Assistant JSON:\n"
-    "{\n  \"need_clarification\": true,\n  \"clarification_question\": \"Sure – when should I remind you to pay rent?\"\n}\n\n"
-    "# Example – complete reminder\n"
-    "User says: Remind me tomorrow at 9am to pay rent\n"
+    "{\n"
+    "  \"need_clarification\": true,\n"
+    "  \"clarification_question\": \"Sure – what time should I remind you to call John?\"\n"
+    "}\n\n"
+    "# Example – multiple triggers (recurring)\n"
+    "User says: Remind me to take my medicine every day at 9am\n"
     "Assistant JSON:\n"
-    "{\n  \"need_clarification\": false,\n  \"reminder\": {\n    \"user_id\": \"5551234\",\n    \"reminder_text\": \"Pay rent\",\n    \"triggers\": [\n      {\n        \"type\": \"time\",\n        \"at\": \"2025-05-01T09:00:00Z\",\n        \"timezone\": \"UTC\"\n      }\n    ],\n    \"channel\": \"sms\"\n  }\n}\n"
+    "{\n"
+    "  \"need_clarification\": false,\n"
+    "  \"reminder\": {\n"
+    "    \"user_id\": \"5551234\",\n"
+    "    \"reminder_text\": \"take my medicine\",\n"
+    "    \"triggers\": [\n"
+    "      {\"type\": \"time\", \"at\": \"2025-04-27T09:00:00Z\", \"timezone\": \"UTC\"},\n"
+    "      {\"type\": \"recurrence\", \"pattern\": \"daily\", \"time\": \"09:00\"}\n"
+    "    ],\n"
+    "    \"channel\": \"sms\"\n"
+    "  }\n"
+    "}\n\n"
+    "# Example – image in envelope\n"
+    "User sends an image of a prescription with the text: 'Remind me to refill in 2 weeks'\n"
+    "Assistant JSON:\n"
+    "{\n"
+    "  \"need_clarification\": false,\n"
+    "  \"reminder\": {\n"
+    "    \"user_id\": \"5551234\",\n"
+    "    \"reminder_text\": \"refill prescription\",\n"
+    "    \"triggers\": [\n"
+    "      {\"type\": \"time\", \"at\": \"2025-05-10T00:00:00Z\", \"timezone\": \"UTC\"}\n"
+    "    ],\n"
+    "    \"channel\": \"sms\"\n"
+    "  }\n"
+    "}\n\n"
+    "# Example – non-UTC timezone\n"
+    "Envelope.timestamp: \"2025-04-26T08:00:00-07:00\"\n"
+    "User says: Remind me at 10am\n"
+    "Assistant JSON:\n"
+    "{\n"
+    "  \"need_clarification\": false,\n"
+    "  \"reminder\": {\n"
+    "    \"user_id\": \"5551234\",\n"
+    "    \"reminder_text\": \"(unspecified)\",\n"
+    "    \"triggers\": [\n"
+    "      {\"type\": \"time\", \"at\": \"2025-04-26T10:00:00-07:00\", \"timezone\": \"America/Los_Angeles\"}\n"
+    "    ],\n"
+    "    \"channel\": \"sms\"\n"
+    "  }\n"
+    "}\n\n"
+    "# Example – negative (bad JSON, unknown key)\n"
+    "User says: Remind me to water the plants\n"
+    "Assistant JSON:\n"
+    "{\n"
+    "  \"need_clarification\": false,\n"
+    "  \"reminder\": {\n"
+    "    \"user_id\": \"5551234\",\n"
+    "    \"reminder_text\": \"water the plants\",\n"
+    "    \"triggers\": [\n"
+    "      {\"type\": \"time\", \"at\": \"2025-04-26T18:00:00Z\", \"timezone\": \"UTC\"}\n"
+    "    ],\n"
+    "    \"channel\": \"sms\",\n"
+    "    \"foo\": \"bar\"  # ❌ This is invalid; do not invent unknown keys.\n"
+    "  }\n"
+    "}\n\n"
+    "# Example – ambiguous/unrecognized instruction\n"
+    "User says: Just checking in!\n"
+    "Assistant JSON:\n"
+    "{\n"
+    "  \"need_clarification\": true,\n"
+    "  \"clarification_question\": \"Could you please specify what you want to be reminded about and when?\"\n"
+    "}\n"
 )
 
-_TEXT_TEMPLATE = (
+
+_TEXT_TEMPLATE: Final = (
     "# Envelope\n{envelope}\n\n"
     "# OCR_Text\n{ocr}\n\n"
     "Respond with JSON per the schema."
 )
 
-_FUNCTION_DEF = {
+_FUNCTION_DEF: Final = {
     "name": "parse_reminder",
     "description": "Extract a ReminderTask or ask a single clarification question.",
     "parameters": {
@@ -101,8 +198,7 @@ _FUNCTION_DEF = {
         "additionalProperties": False,
     },
 }
-
-INTENT_SYNONYMS: dict[str, str] = {}
+# INTENT_SYNONYMS removed as dead code
 
 FUNCTIONS = [
     {"type": "function", "function": _FUNCTION_DEF},
@@ -170,9 +266,13 @@ FUNCTIONS = [
 ]
 
 def _safe_truncate(obj: Any, max_chars: int = 2_000) -> str:
-    """Truncate JSON serialized object to max_chars."""
+    """Truncate JSON serialized object to max_chars, avoiding mid-codepoint cuts."""
     txt = json.dumps(obj, ensure_ascii=False)
-    return txt if len(txt) <= max_chars else txt[: max_chars] + " …truncated…"
+    if len(txt) <= max_chars:
+        return txt
+    # Avoid cutting in the middle of a unicode code point
+    truncated = txt[:max_chars].rstrip("\uFFFD")
+    return truncated + " …truncated…"
 
 # ──────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -188,7 +288,7 @@ def _build_messages(env: Dict[str, Any]) -> List[ChatCompletionMessageParam]:
     """Compose a multimodal message list for Chat Completions."""
     pruned_env = {
         "from": env.get("user_id"),
-        "body": env.get("body", "")[:280] if "body" in env else env.get("instruction", "")[:280],
+        "body": (env.get("body") or env.get("instruction") or "")[:280],
         "images": [img.get("url") or img.get("external_url") for img in env.get("images", [])],
         "timestamp": env.get("timestamp"),
     }
@@ -197,14 +297,19 @@ def _build_messages(env: Dict[str, Any]) -> List[ChatCompletionMessageParam]:
             envelope=_safe_truncate(pruned_env), ocr=""
         )}
     ]
-    for url in pruned_env["images"]:
+    # Limit to first 3 images to avoid token bloat
+    for url in pruned_env["images"][:3]:
         if url:
             user_payload.append({"type": "image_url", "image_url": {"url": url}})
 
-    return [
+    messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user",   "content": user_payload},
     ]
+    # Add assistant ack if nothing is extractable (empty body/images)
+    if not pruned_env["body"] and not pruned_env["images"]:
+        messages.append({"role": "assistant", "content": "ack"})
+    return messages
 
 
 # Retry only on transport / rate-limit / backend errors
@@ -213,68 +318,76 @@ RETRY_ERRORS = (
     openai.APIConnectionError,
     openai.RateLimitError,
     openai.APITimeoutError,
+    openai.InternalServerError,  # Added for 5xx
 )
 
 
-@retry(
-    wait=wait_random_exponential(multiplier=1, max=30),
-    stop=stop_after_attempt(3),
-    retry=retry_if_exception_type(RETRY_ERRORS),
-)
-async def _call_openai(messages: List[ChatCompletionMessageParam]) -> str:
-    """Deprecated one-shot OpenAI call (kept for potential unit tests)."""
-    raise RuntimeError("_call_openai is deprecated; use _run_openai_with_tools() instead")
 
+
+# Import tool functions at top to avoid dynamic import overhead
+from app.utils.web_fetch import fetch_url_content
+from app.utils.photo_metadata import extract_photo_metadata
+
+MAX_TOOL_ITERS: Final = 3
 
 async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam]) -> str:
     """Loop calling OpenAI, executing tools until we get parse_reminder."""
-    max_iters = 3
-    for _ in range(max_iters):
+    # Build kwargs for temperature only if supported
+    kwargs = {}
+    if MODEL_SUPPORTS_TEMP:
+        kwargs["temperature"] = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))
+    for _ in range(MAX_TOOL_ITERS):
         response = await _client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
             tools=FUNCTIONS,
             tool_choice={"type": "function", "function": {"name": "parse_reminder"}},
             timeout=OPENAI_TIMEOUT,
+            **kwargs,
         )
         msg = response.choices[0].message
         if msg.tool_calls:
-            # Preserve the assistant message so the model has full context
             messages.append(msg)
             call = msg.tool_calls[0]
             name = call.function.name
             args = json.loads(call.function.arguments)
-            # Execute tool
-            if name == "lookup_reminders":
-                results = await db.search_reminders(
+            # Map function names to callables
+            tool_map = {
+                "lookup_reminders": lambda: db_io.search_reminders(
                     user_id=args["user_id"],
                     keyword=args.get("keyword"),
                     limit=args.get("limit", 5),
-                )
-                payload = json.dumps(results)
-            elif name == "lookup_envelopes":
-                results = await db.search_envelopes(
+                ),
+                "lookup_envelopes": lambda: db_io.search_envelopes(
                     user_id=args["user_id"],
                     keyword=args.get("keyword"),
                     limit=args.get("limit", 5),
-                )
-                payload = json.dumps(results)
-            elif name == "parse_reminder":
-                return call.function.arguments  # already JSON str
-            elif name == "fetch_url_content":
-                from app.utils.web_fetch import fetch_url_content
-                payload = await fetch_url_content(args["url"], args.get("max_chars", 10000))
-            elif name == "fetch_photo_metadata":
-                from app.utils.photo_metadata import extract_photo_metadata
-                meta = await asyncio.to_thread(extract_photo_metadata, args["url"])
-                payload = json.dumps(meta)
+                ),
+                "fetch_url_content": lambda: fetch_url_content(args["url"], args.get("max_chars", 10000)),
+                "fetch_photo_metadata": lambda: asyncio.to_thread(extract_photo_metadata, args["url"]),
+            }
+            if name == "parse_reminder":
+                data = json.loads(call.function.arguments)
+                if not data.get("need_clarification", False):
+                    task = data.get("reminder", {})
+                    # Guard against malformed triggers
+                    triggers = task.get("triggers")
+                    if not triggers or not isinstance(triggers, list) or not all(isinstance(t, dict) for t in triggers):
+                        clarification_text = f"Sure – when should I remind you about \"{task.get('reminder_text', 'that')}\"?"
+                        return json.dumps({
+                            "need_clarification": True,
+                            "clarification_question": clarification_text
+                        })
+                return call.function.arguments
+            elif name in tool_map:
+                result = await tool_map[name]()
+                payload = json.dumps(result) if not isinstance(result, str) else result
             else:
                 payload = "{}"
-            # Append tool response and loop
             messages.append({"role": "tool", "tool_call_id": call.id, "name": name, "content": payload})
         else:
-            # No tool call; assume assistant responded with final JSON
-            return msg.content or ""
+            _LOGGER.error(f"LLM failed to call required function. Response: {msg}")
+            raise ValueError("Assistant failed to call the required function")
     raise ValueError("Exceeded max tool iterations without parse_reminder")
 
 
@@ -289,23 +402,21 @@ async def run(envelope: Dict[str, Any]) -> ReminderReply:
     """
     if not OPENAI_API_KEY:
         # local dev shortcut
-        dt = datetime.now(timezone.utc) + timedelta(hours=1)
+        dt_obj = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
         return ReminderReply(
             need_clarification=False,
             reminder=ReminderTask(
                 user_id=envelope.get("user_id", "unknown"),
                 reminder_text=envelope.get("body", envelope.get("instruction", "todo")),
-                triggers=[TimeTrigger(at=dt, timezone="UTC")],
+                triggers=[TimeTrigger(at=dt_obj, timezone="UTC")],
             ),
         )
 
     try:
         msgs = _build_messages(envelope)
         raw_json = await _run_openai_with_tools(msgs)
-        print("LLM raw JSON:", raw_json)
         # Validate by parsing then re-serializing to ensure proper JSON
         parsed_data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
-        # Fallback: if model omitted need_clarification wrapper, assume full reminder
         if isinstance(parsed_data, dict) and "need_clarification" not in parsed_data:
             parsed_data = {"need_clarification": False, "reminder": parsed_data}
         normalized_json = json.dumps(parsed_data, ensure_ascii=False)
@@ -329,7 +440,8 @@ if __name__ == "__main__":
         }
     }
 
-    pprint.pp(asyncio.run(run(dummy_env)))
+    print("\n--- Result ---")
+    pprint.pp(asyncio.run(run(dummy_env)).model_dump())
 
 # ─────────────────────────── background helper ─────────────────────── #
 
@@ -340,7 +452,9 @@ async def run_and_store(envelope: Dict[str, Any]):
     try:
         reply = await run(envelope)
         if not reply.need_clarification and reply.reminder:
-            await db.insert_reminder(reply.reminder)
-        # else: could send clarification SMS here if needed
+            await db_io.insert_reminder(reply.reminder)
+        else:
+            # TODO: send_sms(...) for clarification
+            pass
     except Exception as exc:
-        _LOGGER.error(f"run_and_store failed: {exc}")
+        _LOGGER.error(f"run_and_store failed: {exc}", extra={"user_id": envelope.get("user_id")})
