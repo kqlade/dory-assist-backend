@@ -302,7 +302,7 @@ async def run(envelope: Dict[str, Any]) -> ReminderReply:
     try:
         msgs = _build_messages(envelope)
         raw_json = await _run_openai_with_tools(msgs)
-        _LOGGER.info("LLM raw JSON: %s", raw_json)
+        print("LLM raw JSON:", raw_json)
         # Validate by parsing then re-serializing to ensure proper JSON
         parsed_data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
         # Fallback: if model omitted need_clarification wrapper, assume full reminder
