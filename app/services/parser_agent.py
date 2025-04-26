@@ -220,22 +220,8 @@ RETRY_ERRORS = (
     retry=retry_if_exception_type(RETRY_ERRORS),
 )
 async def _call_openai(messages: List[ChatCompletionMessageParam]) -> str:
-    """Call OpenAI with the parse_reminder tool and return JSON string."""
-    rsp = await _client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=messages,
-        tools=[{"type": "function", "function": _FUNCTION_DEF}],
-        tool_choice={"type": "function", "function": {"name": "parse_reminder"}},
-        timeout=OPENAI_TIMEOUT,
-    )
-    msg = rsp.choices[0].message
-    
-    # Get JSON either from tool arguments or message content
-    if msg.tool_calls:
-        return msg.tool_calls[0].function.arguments
-    
-    # Fallback to content if no tool call (shouldn't happen with tool_choice specified)
-    return msg.content or ""
+    """Deprecated one-shot OpenAI call (kept for potential unit tests)."""
+    raise RuntimeError("_call_openai is deprecated; use _run_openai_with_tools() instead")
 
 
 async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam]) -> str:
@@ -251,6 +237,8 @@ async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam]) -> 
         )
         msg = response.choices[0].message
         if msg.tool_calls:
+            # Preserve the assistant message so the model has full context
+            messages.append(msg)
             call = msg.tool_calls[0]
             name = call.function.name
             args = json.loads(call.function.arguments)
