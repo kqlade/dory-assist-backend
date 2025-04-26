@@ -39,7 +39,7 @@ __all__ = ["run", "run_and_store"]
 # ──────────────────────────────────────────────────────────────────────────
 
 OPENAI_API_KEY: Final = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL: Final = os.environ.get("OPENAI_MODEL", "o4-mini").strip()
+OPENAI_MODEL: Final = os.environ.get("OPENAI_MODEL", "gpt-4.1").strip()
 OPENAI_TIMEOUT: Final = float(os.getenv("OPENAI_TIMEOUT", "30"))
 
 MODEL_SUPPORTS_TEMP: Final = not OPENAI_MODEL.startswith(("o3-", "o4-"))
