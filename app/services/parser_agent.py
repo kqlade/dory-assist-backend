@@ -295,7 +295,6 @@ async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam]) -> 
 async def run(envelope: Dict[str, Any]) -> ReminderReply:
     """
     Parse an MMS/SMS envelope into a structured `ReminderReply`.
-
     Falls back to a dummy "one-off in 1 h" reminder if no OpenAI key present.
     """
     if not OPENAI_API_KEY:
@@ -312,12 +311,10 @@ async def run(envelope: Dict[str, Any]) -> ReminderReply:
 
     try:
         msgs = _build_messages(envelope)
-        raw_json = await _call_openai(msgs)
-        
+        raw_json = await _run_openai_with_tools(msgs)
         # Validate by parsing then re-serializing to ensure proper JSON
         parsed_data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
         normalized_json = json.dumps(parsed_data, ensure_ascii=False)
-        
         return ReminderReply.model_validate_json(normalized_json)
     except Exception as exc:
         _LOGGER.warning("Failed to parse assistant output: %s", exc)
