@@ -50,8 +50,20 @@ _SYSTEM_PROMPT = (
     "You are an intake assistant that extracts **time-based reminders** from "
     "user SMS/MMS (text, images and links). "
     "Return ONLY JSON that matches the given schema. "
-    "If anything is missing, set `need_clarification=true` and provide exactly "
-    "one `clarification_question`."
+    "If you can fully determine the reminder, create the `reminder` object. "
+    "**Crucially:** Every `reminder` *must* include a `triggers` array with at least one valid trigger. "
+    "If you cannot determine a specific trigger (or any required field), you *must* set "
+    "`need_clarification=true` and provide exactly one `clarification_question` asking for the missing info. "
+    "Do NOT return a `reminder` object if clarification is required."
+    "\n\n"
+    "# Example – clarification needed\n"
+    "User says: Remind me to pay rent\n"
+    "Assistant JSON:\n"
+    "{\n  \"need_clarification\": true,\n  \"clarification_question\": \"Sure – when should I remind you to pay rent?\"\n}\n\n"
+    "# Example – complete reminder\n"
+    "User says: Remind me tomorrow at 9am to pay rent\n"
+    "Assistant JSON:\n"
+    "{\n  \"need_clarification\": false,\n  \"reminder\": {\n    \"user_id\": \"5551234\",\n    \"reminder_text\": \"Pay rent\",\n    \"triggers\": [\n      {\n        \"type\": \"time\",\n        \"at\": \"2025-05-01T09:00:00Z\",\n        \"timezone\": \"UTC\"\n      }\n    ],\n    \"channel\": \"sms\"\n  }\n}\n"
 )
 
 _TEXT_TEMPLATE = (
@@ -73,7 +85,11 @@ _FUNCTION_DEF = {
                 "properties": {
                     "user_id": {"type": "string"},
                     "reminder_text": {"type": "string"},
-                    "triggers": {"type": "array", "items": {"type": "object"}},
+                    "triggers": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "minItems": 1  # must include at least one trigger
+                    },
                     "channel": {"type": "string", "enum": ["sms"]},
                 },
                 "required": ["user_id", "reminder_text", "triggers"],
