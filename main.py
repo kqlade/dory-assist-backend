@@ -37,7 +37,7 @@ async def shutdown_event():
 async def process_envelope_background(envelope: dict):
     """Parse envelope with LLM and push to appropriate queues."""
     try:
-        reply = await parser_agent.run(envelope, ocr_text=None)
+        reply = await parser_agent.run(envelope)
     except Exception as exc:
         # Don't bubble up; just log
         print("Parser agent failed:", exc)
