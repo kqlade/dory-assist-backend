@@ -29,22 +29,19 @@ from tenacity import (
 from app.types.parser_contract import ReminderReply, ReminderTask, TimeTrigger
 import db as db_io
 
+__all__ = ["run", "run_and_store"]
+
 # ──────────────────────────────────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────────────────────────────────
 
 from typing import Final
 
-try:
-    OPENAI_API_KEY: Final = os.environ["OPENAI_API_KEY"].strip()
-    OPENAI_MODEL: Final = os.environ["OPENAI_MODEL"].strip()
-    OPENAI_TIMEOUT: Final = float(os.getenv("OPENAI_TIMEOUT", "30"))
-except KeyError as e:
-    raise RuntimeError(f"Missing env var: {e}") from None
-except ValueError as e:
-    raise RuntimeError(f"Invalid config value: {e}") from None
+OPENAI_API_KEY: Final = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL: Final = os.environ.get("OPENAI_MODEL", "o4-mini").strip()
+OPENAI_TIMEOUT: Final = float(os.getenv("OPENAI_TIMEOUT", "30"))
 
-MODEL_SUPPORTS_TEMP: Final = not OPENAI_MODEL.startswith(("o3", "o4"))
+MODEL_SUPPORTS_TEMP: Final = not OPENAI_MODEL.startswith(("o3-", "o4-"))
 
 if not MODEL_SUPPORTS_TEMP and "OPENAI_TEMPERATURE" in os.environ:
     raise RuntimeError(
@@ -52,9 +49,8 @@ if not MODEL_SUPPORTS_TEMP and "OPENAI_TEMPERATURE" in os.environ:
         "remove OPENAI_TEMPERATURE from the environment."
     )
 
+# NOTE: For large deployments, consider pooling AsyncOpenAI clients in a shared module to reuse HTTP connections.
 _client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT)
-
-__all__ = ["run", "run_and_store"]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -171,37 +167,9 @@ _TEXT_TEMPLATE: Final = (
     "Respond with JSON per the schema."
 )
 
-_FUNCTION_DEF: Final = {
-    "name": "parse_reminder",
-    "description": "Extract a ReminderTask or ask a single clarification question.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "need_clarification": {"type": "boolean"},
-            "clarification_question": {"type": "string"},
-            "reminder": {
-                "type": "object",
-                "properties": {
-                    "user_id": {"type": "string"},
-                    "reminder_text": {"type": "string"},
-                    "triggers": {
-                        "type": "array",
-                        "items": {"type": "object"},
-                        "minItems": 1  # must include at least one trigger
-                    },
-                    "channel": {"type": "string", "enum": ["sms"]},
-                },
-                "required": ["user_id", "reminder_text", "triggers"],
-            },
-        },
-        "required": ["need_clarification"],
-        "additionalProperties": False,
-    },
-}
-# INTENT_SYNONYMS removed as dead code
+# NOTE: As of 2025, we use OpenAI's response_format={"type": "json_object"} for structured outputs, per official recommendations. No dummy parse_reminder tool is needed.
 
 FUNCTIONS = [
-    {"type": "function", "function": _FUNCTION_DEF},
     {
         "type": "function",
         "function": {
@@ -267,7 +235,10 @@ FUNCTIONS = [
 
 def _safe_truncate(obj: Any, max_chars: int = 2_000) -> str:
     """Truncate JSON serialized object to max_chars, avoiding mid-codepoint cuts."""
-    txt = json.dumps(obj, ensure_ascii=False)
+    try:
+        txt = json.dumps(obj, ensure_ascii=False)
+    except ValueError:
+        txt = str(obj)
     if len(txt) <= max_chars:
         return txt
     # Avoid cutting in the middle of a unicode code point
@@ -306,9 +277,7 @@ def _build_messages(env: Dict[str, Any]) -> List[ChatCompletionMessageParam]:
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user",   "content": user_payload},
     ]
-    # Add assistant ack if nothing is extractable (empty body/images)
-    if not pruned_env["body"] and not pruned_env["images"]:
-        messages.append({"role": "assistant", "content": "ack"})
+    # Do NOT add assistant "ack"; it can prematurely halt tool-calling.
     return messages
 
 
@@ -330,18 +299,24 @@ from app.utils.photo_metadata import extract_photo_metadata
 
 MAX_TOOL_ITERS: Final = 3
 
-async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam]) -> str:
-    """Loop calling OpenAI, executing tools until we get parse_reminder."""
+async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam], openai_client: AsyncOpenAI = None) -> str:
+    """
+    Loop calling OpenAI, executing tools until model returns a valid JSON response.
+    Uses response_format={"type": "json_object"} for structured outputs.
+    Accepts an optional openai_client for testing/mocking.
+    """
+    client = openai_client or _client
     # Build kwargs for temperature only if supported
     kwargs = {}
     if MODEL_SUPPORTS_TEMP:
         kwargs["temperature"] = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))
     for _ in range(MAX_TOOL_ITERS):
-        response = await _client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
             tools=FUNCTIONS,
-            tool_choice={"type": "function", "function": {"name": "parse_reminder"}},
+            tool_choice="auto",
+            response_format={"type": "json_object"},
             timeout=OPENAI_TIMEOUT,
             **kwargs,
         )
@@ -351,54 +326,48 @@ async def _run_openai_with_tools(messages: List[ChatCompletionMessageParam]) -> 
             call = msg.tool_calls[0]
             name = call.function.name
             args = json.loads(call.function.arguments)
-            # Map function names to callables
-            tool_map = {
-                "lookup_reminders": lambda: db_io.search_reminders(
+            # Use explicit if/elif to avoid lambda late-binding bugs
+            if name == "lookup_reminders":
+                results = await db_io.search_reminders(
                     user_id=args["user_id"],
                     keyword=args.get("keyword"),
                     limit=args.get("limit", 5),
-                ),
-                "lookup_envelopes": lambda: db_io.search_envelopes(
+                )
+                payload = json.dumps(results)
+            elif name == "lookup_envelopes":
+                results = await db_io.search_envelopes(
                     user_id=args["user_id"],
                     keyword=args.get("keyword"),
                     limit=args.get("limit", 5),
-                ),
-                "fetch_url_content": lambda: fetch_url_content(args["url"], args.get("max_chars", 10000)),
-                "fetch_photo_metadata": lambda: asyncio.to_thread(extract_photo_metadata, args["url"]),
-            }
-            if name == "parse_reminder":
-                data = json.loads(call.function.arguments)
-                if not data.get("need_clarification", False):
-                    task = data.get("reminder", {})
-                    # Guard against malformed triggers
-                    triggers = task.get("triggers")
-                    if not triggers or not isinstance(triggers, list) or not all(isinstance(t, dict) for t in triggers):
-                        clarification_text = f"Sure – when should I remind you about \"{task.get('reminder_text', 'that')}\"?"
-                        return json.dumps({
-                            "need_clarification": True,
-                            "clarification_question": clarification_text
-                        })
-                return call.function.arguments
-            elif name in tool_map:
-                result = await tool_map[name]()
-                payload = json.dumps(result) if not isinstance(result, str) else result
+                )
+                payload = json.dumps(results)
+            elif name == "fetch_url_content":
+                payload = await fetch_url_content(args["url"], args.get("max_chars", 10000))
+            elif name == "fetch_photo_metadata":
+                meta = await asyncio.to_thread(extract_photo_metadata, args["url"])
+                payload = json.dumps(meta)
             else:
                 payload = "{}"
             messages.append({"role": "tool", "tool_call_id": call.id, "name": name, "content": payload})
         else:
-            _LOGGER.error(f"LLM failed to call required function. Response: {msg}")
-            raise ValueError("Assistant failed to call the required function")
-    raise ValueError("Exceeded max tool iterations without parse_reminder")
+            # Final answer: model returned a JSON blob as assistant message
+            return msg.content
+    raise ValueError("Exceeded max tool iterations without valid JSON response")
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # Public entry-point
 # ──────────────────────────────────────────────────────────────────────────
 
+class ParseFailure(Exception):
+    """Raised when model output cannot be parsed or validated."""
+    pass
+
 async def run(envelope: Dict[str, Any]) -> ReminderReply:
     """
     Parse an MMS/SMS envelope into a structured `ReminderReply`.
     Falls back to a dummy "one-off in 1 h" reminder if no OpenAI key present.
+    Prints and logs the LLM's raw JSON output and clarification, if any.
     """
     if not OPENAI_API_KEY:
         # local dev shortcut
@@ -415,22 +384,39 @@ async def run(envelope: Dict[str, Any]) -> ReminderReply:
     try:
         msgs = _build_messages(envelope)
         raw_json = await _run_openai_with_tools(msgs)
+        print(f"LLM raw JSON output: {raw_json}")
+        _LOGGER.info(f"LLM raw JSON output: {raw_json}")
         # Validate by parsing then re-serializing to ensure proper JSON
-        parsed_data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+        try:
+            parsed_data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+        except json.JSONDecodeError as e:
+            _LOGGER.error(f"LLM output is not valid JSON: {raw_json}")
+            raise ParseFailure("Unable to decode LLM output as JSON") from e
         if isinstance(parsed_data, dict) and "need_clarification" not in parsed_data:
             parsed_data = {"need_clarification": False, "reminder": parsed_data}
         normalized_json = json.dumps(parsed_data, ensure_ascii=False)
-        return ReminderReply.model_validate_json(normalized_json)
+        # If clarification is needed, print/log it
+        if isinstance(parsed_data, dict) and parsed_data.get("need_clarification"):
+            clar = parsed_data.get("clarification_question", "<none>")
+            print(f"LLM clarification: {clar}")
+            _LOGGER.info(f"LLM clarification: {clar}")
+        try:
+            return ReminderReply.model_validate_json(normalized_json)
+        except Exception as e:
+            _LOGGER.error(f"Failed to validate ReminderReply: {normalized_json}")
+            raise ParseFailure("Unable to validate LLM output against ReminderReply schema") from e
+    except ParseFailure:
+        raise
     except Exception as exc:
         _LOGGER.warning("Failed to parse assistant output: %s", exc)
-        raise ValueError("Unable to interpret LLM output") from exc
+        raise ParseFailure("Unable to interpret LLM output") from exc
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # Optional: quick CLI test
 # ──────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import asyncio, sys, pprint, json as _json
+    import asyncio, pprint, json as _json
 
     dummy_env = {
         "payload": {
@@ -445,16 +431,16 @@ if __name__ == "__main__":
 
 # ─────────────────────────── background helper ─────────────────────── #
 
-async def run_and_store(envelope: Dict[str, Any]):
+async def run_and_store(envelope: Dict[str, Any], clarification_handler=None):
     """
     Run the parser and store the reminder if found.
+    If clarification is needed, call clarification_handler(reminder_reply, envelope) if provided.
     """
     try:
         reply = await run(envelope)
         if not reply.need_clarification and reply.reminder:
             await db_io.insert_reminder(reply.reminder)
-        else:
-            # TODO: send_sms(...) for clarification
-            pass
+        elif clarification_handler is not None:
+            await clarification_handler(reply, envelope)
     except Exception as exc:
         _LOGGER.error(f"run_and_store failed: {exc}", extra={"user_id": envelope.get("user_id")})
