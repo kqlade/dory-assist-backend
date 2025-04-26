@@ -19,8 +19,11 @@ except ImportError:
     pass
 
 # ───────────────────────── helpers ──────────────────────────
+from config import settings
+
 def _download(url: str) -> bytes:
-    resp = requests.get(url, timeout=10)
+    timeout = getattr(settings, "PHOTO_METADATA_TIMEOUT", 10)
+    resp = requests.get(url, timeout=timeout)
     resp.raise_for_status()
     return resp.content
 

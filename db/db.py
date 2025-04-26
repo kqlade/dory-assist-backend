@@ -5,15 +5,14 @@ Uses SQLAlchemy 2.0 + asyncpg driver – no raw SQL strings in app code.
 
 from __future__ import annotations
 
-import os
 import json
-import asyncio
-from datetime import datetime, timezone, timedelta
-from typing import Sequence, TypedDict, Any, AsyncGenerator
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator
 from uuid import uuid4
+from config import settings
 
 from sqlalchemy import (
-    text, select, update, func, JSON, DateTime
+    select, update, func, JSON, DateTime
 )
 from sqlalchemy.orm import (
     DeclarativeBase, Mapped, mapped_column
@@ -37,7 +36,7 @@ _engine = None
 _session_maker: async_sessionmaker[AsyncSession] | None = None
 
 def _build_url() -> str:
-    url = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")
+    url = settings.DATABASE_URL or getattr(settings, "DATABASE_PUBLIC_URL", None)
     if not url:
         raise RuntimeError("DATABASE_URL not set")
     if "+asyncpg" not in url:

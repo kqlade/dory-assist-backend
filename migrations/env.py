@@ -35,11 +35,15 @@ target_metadata = Base.metadata
 # ---------------------------------------------------------------------
 def _database_url() -> str:
     """Determine the connection string Alembic should use."""
-    url = (
-        os.getenv("DATABASE_URL")
-        or os.getenv("DATABASE_PUBLIC_URL")
-        or config.get_main_option("sqlalchemy.url")
-    )
+    try:
+        from config import settings
+        url = settings.DATABASE_URL or getattr(settings, "DATABASE_PUBLIC_URL", None)
+    except Exception:
+        url = (
+            os.getenv("DATABASE_URL")
+            or os.getenv("DATABASE_PUBLIC_URL")
+            or config.get_main_option("sqlalchemy.url")
+        )
     if not url:
         raise RuntimeError(
             "DATABASE_URL not set and sqlalchemy.url missing from alembic.ini"

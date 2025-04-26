@@ -25,4 +25,4 @@ pyexiftool==0.5.6             # Python wrapper – still needs exiftool binary
 # ───── Dev / tests ─────────────────────────────────────────────
 pytest>=8.0
 pytest-asyncio>=0.23
-crawl4ai                       # (you had this – left as-is)
+openai-agents

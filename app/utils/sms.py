@@ -1,8 +1,8 @@
-import os
+from config import settings
 import telnyx
 
-FROM_NUM = os.getenv("TELNYX_FROM")
-TELNYX_API_KEY = os.getenv("TELNYX_API_KEY")
+FROM_NUM = settings.TELNYX_FROM_NUMBER
+TELNYX_API_KEY = settings.TELNYX_API_KEY
 if TELNYX_API_KEY:
     telnyx.api_key = TELNYX_API_KEY
 
