@@ -56,6 +56,8 @@ _SYSTEM_PROMPT = (
     "`need_clarification=true` and provide exactly one `clarification_question` asking for the missing info. "
     "Do NOT return a `reminder` object if clarification is required."
     "\n\n"
+    "Always include the top-level key `need_clarification`. "
+    "\n\n"
     "# Example – clarification needed\n"
     "User says: Remind me to pay rent\n"
     "Assistant JSON:\n"
@@ -300,8 +302,12 @@ async def run(envelope: Dict[str, Any]) -> ReminderReply:
     try:
         msgs = _build_messages(envelope)
         raw_json = await _run_openai_with_tools(msgs)
+        _LOGGER.debug("LLM raw JSON: %s", raw_json)
         # Validate by parsing then re-serializing to ensure proper JSON
         parsed_data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+        # Fallback: if model omitted need_clarification wrapper, assume full reminder
+        if isinstance(parsed_data, dict) and "need_clarification" not in parsed_data:
+            parsed_data = {"need_clarification": False, "reminder": parsed_data}
         normalized_json = json.dumps(parsed_data, ensure_ascii=False)
         return ReminderReply.model_validate_json(normalized_json)
     except Exception as exc:
