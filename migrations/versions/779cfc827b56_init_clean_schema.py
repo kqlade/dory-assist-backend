@@ -48,9 +48,10 @@ def upgrade() -> None:
                existing_server_default=sa.text("'received'::text"))
     op.alter_column('message_envelopes', 'created_at',
                existing_type=postgresql.TIMESTAMP(timezone=True),
-               type_=sa.DateTime(),
+               type_=sa.TIMESTAMP(timezone=True),
                existing_nullable=False,
-               existing_server_default=sa.text('now()'))
+               existing_server_default=sa.text('now()'),
+               postgresql_using="created_at AT TIME ZONE 'UTC'")
     op.drop_index('envelopes_status_idx', table_name='message_envelopes')
     op.drop_index('envelopes_user_idx', table_name='message_envelopes')
     op.alter_column('reminders', 'reminder_id',
@@ -154,10 +155,11 @@ def downgrade() -> None:
     op.create_index('envelopes_user_idx', 'message_envelopes', ['user_id', sa.literal_column('created_at DESC')], unique=False)
     op.create_index('envelopes_status_idx', 'message_envelopes', ['status'], unique=False)
     op.alter_column('message_envelopes', 'created_at',
-               existing_type=sa.DateTime(),
+               existing_type=sa.TIMESTAMP(timezone=True),
                type_=postgresql.TIMESTAMP(timezone=True),
                existing_nullable=False,
-               existing_server_default=sa.text('now()'))
+               existing_server_default=sa.text('now()'),
+               postgresql_using="created_at AT TIME ZONE 'UTC'")
     op.alter_column('message_envelopes', 'status',
                existing_type=sa.String(),
                type_=sa.TEXT(),

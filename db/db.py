@@ -13,7 +13,7 @@ from typing import Sequence, TypedDict, Any, AsyncGenerator
 from uuid import uuid4
 
 from sqlalchemy import (
-    text, select, update, func, JSON
+    text, select, update, func, JSON, DateTime
 )
 from sqlalchemy.orm import (
     DeclarativeBase, Mapped, mapped_column
@@ -91,7 +91,7 @@ class MessageEnvelope(Base):
     instruction: Mapped[str]
     payload:     Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status:      Mapped[str]   = mapped_column(default="received")
-    created_at:  Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at:  Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 # ──────────────────────────────────────────────────────────────────────
